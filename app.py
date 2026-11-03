@@ -12,13 +12,17 @@ from tools import SUB_CALLS_KEY, TOOLS, run_tool
 
 # --- Config ---
 
-SYSTEM_PROMPT = """You are an NYC Deep Research Agent. Help the user plan activities in New York City.
+SYSTEM_PROMPT = """You are an NYC Deep Research Agent. Help the user make plans in New York City using live data from your tools.
 
 Which tool to use:
+- A place, restaurant, bar, museum, or attraction, including ratings and reviews: search_places.
+- Travel time or how to get between two stops: get_directions. Default to transit in Manhattan and walking for short distances.
 
 How to answer:
-
-Research questions:
+- Only cite ratings, times, prices, and reviews that appear in tool results.
+- For a day or date plan, call search_places for the stops, then get_directions between them.
+- If a tool returns an error, say what failed in plain language and answer with whatever data you did get.
+- Stay in New York City. Keep the reply a short itinerary: the place, why it fits, how long it takes to get there, and one review.
 """
 
 MAX_TOOL_ROUNDS = 8
@@ -124,4 +128,4 @@ def clear(session_id: str | None = None):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8001)))

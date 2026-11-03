@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NYC Deep Research Agent</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 1rem;
+        }
+        #log {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            min-height: 60vh;
+        }
+        .user, .assistant {
+            padding: 0.6rem 0.8rem;
+            border-radius: 8px;
+            white-space: pre-wrap;
+        }
+        .user {
+            align-self: flex-end;
+            max-width: 80%;
+            background: #e8f0fe;
+        }
+        .assistant {
+            background: #f4f4f5;
+        }
+        .tools {
+            color: #666;
+            font-size: 0.85rem;
+        }
+        form {
+            display: flex;
+            gap: 0.5rem;
+            align-items: flex-end;
+        }
+        textarea {
+            flex: 1;
+            font: inherit;
+            padding: 0.5rem;
+        }
+        button {
+            font: inherit;
+            padding: 0.5rem 0.8rem;
+        }
+    </style>
+</head>
+<body>
+    <h1>NYC Deep Research Agent</h1>
+    <div id="log"></div>
+    <form id="form">
+        <textarea id="input" rows="2" placeholder="Ask for a plan in New York..."></textarea>
+        <button type="submit">Send</button>
+    </form>
+    <script>
+        const log = document.getElementById("log");
+        const input = document.getElementById("input");
+        const form = document.getElementById("form");
+        let sessionId = null;
+
+        function add(className, text) {
+            const div = document.createElement("div");
+            div.className = className;
+            div.textContent = text;
+            log.appendChild(div);
+            div.scrollIntoView();
+            return div;
+        }
+
+        form.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            const text = input.value.trim();
+            if (!text) return;
+            input.value = "";
+            add("user", text);
+            const pending = add("assistant", "…");
+            try {
+                const res = await fetch("/chat", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ message: text, session_id: sessionId }),
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || res.statusText);
+                sessionId = data.session_id;
+                const calls = data.tool_calls || [];
+                if (calls.length) {
+                    add("tools", "Tools: " + calls.map((call) => call.name).join(", "));
+                }
+                pending.textContent = data.response || "(no response)";
+            } catch (error) {
+                pending.textContent = "Error: " + error.message;
+            }
+            input.focus();
+        });
+    </script>
+</body>
+</html>
