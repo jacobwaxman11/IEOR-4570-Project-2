@@ -10,4 +10,10 @@ dependencies = [
     "google-cloud-aiplatform>=1.40.0",
     "requests>=2.31",
     "python-dotenv>=1.2.3",
+    "beautifulsoup4>=4.15.0",
+    "httpx>=0.28.1",
+    "curl-cffi>=0.17.0",
+    "pandas>=2.3.3",
+    "numpy>=2.2.6",
+    "google-genai>=2.24.0",
 ]
