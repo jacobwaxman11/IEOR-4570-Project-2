@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import statistics
 import threading
 import time
 from pathlib import Path
@@ -648,3 +649,400 @@ def run_sql(query: str) -> str:
         query: A single SELECT or WITH query.
     """
     return _run_sql(query)
+
+
+# --- Analysis tools ---
+#
+# These call the read-only database, then rank or summarize the rows. Composite
+# tools call another tool's __wrapped__ function so they share one query path.
+
+
+def _query_rows(sql: str, params: tuple = ()) -> list[dict]:
+    """Run a parameterized read and return dict rows. Names stay out of the SQL text."""
+    with _db_lock:
+        try:
+            cursor = _db.execute(sql, params)
+            columns = [desc[0] for desc in cursor.description or []]
+            rows = cursor.fetchall()
+        except sqlite3.Error as e:
+            raise ToolError(str(e))
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def _neighborhoods() -> list[str]:
+    match = next(
+        (c for c in COLUMNS if c["table"] == "listings" and c["name"] == "neighborhood"),
+        None,
+    )
+    values = (match or {}).get("enum_values")
+    if values:
+        return list(values)
+    return [
+        row["neighborhood"]
+        for row in _query_rows(
+            "SELECT DISTINCT neighborhood FROM listings "
+            "WHERE neighborhood IS NOT NULL ORDER BY neighborhood"
+        )
+    ]
+
+
+def _resolve_neighborhood(name: str) -> str:
+    cleaned = _clean(name)
+    if not cleaned:
+        raise ToolError("A neighborhood is required.")
+    neighborhoods = _neighborhoods()
+    for neighborhood in neighborhoods:
+        if neighborhood.casefold() == cleaned.casefold():
+            return neighborhood
+    raise ToolError(
+        f"No neighborhood '{cleaned}'. Valid neighborhoods: {', '.join(neighborhoods)}."
+    )
+
+
+def _optional_number(value, label: str) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ToolError(f"{label} must be a number, got {value!r}")
+
+
+def _split_names(neighborhoods) -> list[str]:
+    if isinstance(neighborhoods, (list, tuple)):
+        names = []
+        for item in neighborhoods:
+            names.extend(_split_names(item))
+        return names
+    parts = []
+    for chunk in str(neighborhoods or "").split(","):
+        parts.extend(chunk.split(" and "))
+    return [_clean(part) for part in parts if _clean(part)]
+
+
+def _price_stats(rows: list[dict]) -> dict:
+    rents = [row["rent"] for row in rows if row.get("rent") is not None]
+    per_sqft = [
+        row["rent"] / row["sqft"]
+        for row in rows
+        if row.get("rent") is not None and row.get("sqft")
+    ]
+    stats = {
+        "listings": len(rows),
+        "min_rent": min(rents) if rents else None,
+        "max_rent": max(rents) if rents else None,
+        "avg_rent": round(sum(rents) / len(rents)) if rents else None,
+        "median_rent": round(statistics.median(rents)) if rents else None,
+        "avg_rent_per_sqft": round(sum(per_sqft) / len(per_sqft), 2) if per_sqft else None,
+    }
+    return stats
+
+
+def _listing_rows(sql: str, params: tuple) -> list[dict]:
+    rows = _query_rows(sql, params)
+    for row in rows:
+        for key in ("beds", "baths"):
+            if isinstance(row.get(key), float) and row[key].is_integer():
+                row[key] = int(row[key])
+    return rows
+
+
+@_tool
+def search_listings(
+    neighborhood: str | None = None,
+    min_beds: float | None = None,
+    max_beds: float | None = None,
+    min_baths: float | None = None,
+    min_sqft: float | None = None,
+    max_sqft: float | None = None,
+    min_rent: float | None = None,
+    max_rent: float | None = None,
+    limit: int = 10,
+) -> dict:
+    """Find listings by neighborhood, bedrooms, bathrooms, square feet, and rent.
+
+    Args:
+        neighborhood: Neighborhood name, such as 'Chelsea' or 'Hell's Kitchen'. Optional.
+        min_beds: Minimum bedrooms. Optional.
+        max_beds: Maximum bedrooms. Optional.
+        min_baths: Minimum bathrooms. Optional.
+        min_sqft: Minimum square feet. Listings with no sqft are kept. Optional.
+        max_sqft: Maximum square feet. Listings with no sqft are kept. Optional.
+        min_rent: Minimum monthly rent. Optional.
+        max_rent: Maximum monthly rent. Optional.
+        limit: How many listings to return, 1 to 25. Defaults to 10.
+    """
+    limit = _clamp_int(limit, 10, 1, 25)
+    min_beds = _optional_number(min_beds, "min_beds")
+    max_beds = _optional_number(max_beds, "max_beds")
+    min_baths = _optional_number(min_baths, "min_baths")
+    min_sqft = _optional_number(min_sqft, "min_sqft")
+    max_sqft = _optional_number(max_sqft, "max_sqft")
+    min_rent = _optional_number(min_rent, "min_rent")
+    max_rent = _optional_number(max_rent, "max_rent")
+
+    clauses = ["(listing_status IS NULL OR listing_status = 'ACTIVE')"]
+    params: list = []
+    resolved = None
+    if neighborhood:
+        resolved = _resolve_neighborhood(neighborhood)
+        clauses.append("neighborhood = ?")
+        params.append(resolved)
+    if min_beds is not None:
+        clauses.append("beds >= ?")
+        params.append(min_beds)
+    if max_beds is not None:
+        clauses.append("beds <= ?")
+        params.append(max_beds)
+    if min_baths is not None:
+        clauses.append("baths >= ?")
+        params.append(min_baths)
+    if min_sqft is not None:
+        clauses.append("(sqft IS NULL OR sqft >= ?)")
+        params.append(min_sqft)
+    if max_sqft is not None:
+        clauses.append("(sqft IS NULL OR sqft <= ?)")
+        params.append(max_sqft)
+    if min_rent is not None:
+        clauses.append("rent >= ?")
+        params.append(min_rent)
+    if max_rent is not None:
+        clauses.append("rent <= ?")
+        params.append(max_rent)
+
+    rows = _listing_rows(
+        f"""
+        SELECT listing_id, name AS building, unit, neighborhood, beds, baths, sqft, rent, url
+        FROM listings
+        WHERE {' AND '.join(clauses)}
+        ORDER BY rent IS NULL, rent, listing_id
+        LIMIT ?
+        """,
+        tuple(params) + (limit,),
+    )
+    filters = {
+        "neighborhood": resolved,
+        "min_beds": min_beds,
+        "max_beds": max_beds,
+        "min_baths": min_baths,
+        "min_sqft": min_sqft,
+        "max_sqft": max_sqft,
+        "min_rent": min_rent,
+        "max_rent": max_rent,
+    }
+    return {
+        "neighborhood": resolved,
+        "filters": {key: value for key, value in filters.items() if value is not None},
+        "count": len(rows),
+        "listings": rows,
+    }
+
+
+@_tool
+def get_building_amenities(building: str) -> dict:
+    """List the amenities of one building, and how many of its units have each.
+
+    Args:
+        building: Building name or StreetEasy building slug.
+    """
+    building = _clean(building)
+    if not building:
+        raise ToolError("get_building_amenities needs a building name or slug.")
+
+    def matches(where: str) -> list[dict]:
+        return _query_rows(
+            f"""
+            SELECT building_slug, MIN(name) AS name, COUNT(*) AS units
+            FROM listings
+            WHERE {where}
+            GROUP BY building_slug
+            ORDER BY units DESC, name
+            """,
+            (building, building),
+        )
+
+    found = matches("lower(name) = lower(?) OR lower(building_slug) = lower(?)")
+    if not found:
+        found = matches(
+            "instr(lower(name), lower(?)) > 0 OR instr(lower(building_slug), lower(?)) > 0"
+        )
+    if not found:
+        raise ToolError(f"No building matching '{building}'.")
+    if len(found) > 1:
+        return {
+            "error": f"'{building}' matches more than one building. Pass a more specific name or slug.",
+            "matches": [{"building": row["name"], "building_slug": row["building_slug"], "units": row["units"]} for row in found],
+        }
+
+    chosen = found[0]
+    amenities = _query_rows(
+        """
+        SELECT a.amenity, COUNT(DISTINCT l.listing_id) AS units
+        FROM listings l
+        JOIN listing_amenities a ON l.listing_id = a.listing_id
+        WHERE l.building_slug = ?
+        GROUP BY a.amenity
+        ORDER BY units DESC, a.amenity
+        """,
+        (chosen["building_slug"],),
+    )
+    return {
+        "building": chosen["name"],
+        "building_slug": chosen["building_slug"],
+        "units": chosen["units"],
+        "amenities": amenities,
+    }
+
+
+@_tool
+def get_deals(neighborhood: str | None = None, limit: int = 10) -> dict:
+    """List model deals: predicted rent, actual rent, percent discount, and deal score.
+
+    Args:
+        neighborhood: Limit to one neighborhood. Optional.
+        limit: How many deals to return, 1 to 25. Defaults to 10.
+    """
+    limit = _clamp_int(limit, 10, 1, 25)
+    scored = _query_rows("SELECT COUNT(*) AS n FROM regression_results")[0]["n"]
+    if not scored:
+        raise ToolError(
+            "Deal scores have not been written yet. regression_results is empty. "
+            "Run features.py to score listings before asking for deals."
+        )
+
+    clauses = []
+    params: list = []
+    resolved = None
+    if neighborhood:
+        resolved = _resolve_neighborhood(neighborhood)
+        clauses.append("l.neighborhood = ?")
+        params.append(resolved)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = _listing_rows(
+        f"""
+        SELECT l.listing_id, l.name AS building, l.unit, l.neighborhood,
+               l.beds, l.baths, l.sqft, l.rent AS actual_rent,
+               r.predicted_rent, r.percent_discount, r.deal_score
+        FROM listings l
+        JOIN regression_results r ON l.listing_id = r.listing_id
+        {where}
+        ORDER BY r.deal_score DESC, r.percent_discount DESC, l.listing_id
+        LIMIT ?
+        """,
+        tuple(params) + (limit,),
+    )
+    return {
+        "neighborhood": resolved,
+        "ranked_by": "deal_score",
+        "count": len(rows),
+        "listings": rows,
+    }
+
+
+@_tool
+def cheapest_in_neighborhood(
+    neighborhood: str, min_beds: float | None = None, limit: int = 5
+) -> dict:
+    """Cheapest listings in one neighborhood, ranked by listed rent.
+
+    Args:
+        neighborhood: Neighborhood name, such as 'Chelsea'.
+        min_beds: Minimum bedrooms. Optional.
+        limit: How many listings to return, 1 to 25. Defaults to 5.
+    """
+    found = search_listings.__wrapped__(neighborhood=neighborhood, min_beds=min_beds, limit=limit)
+    return {
+        "neighborhood": found["neighborhood"],
+        "ranked_by": "listed rent",
+        "count": found["count"],
+        "listings": found["listings"],
+    }
+
+
+@_tool
+def best_deals_in_neighborhood(neighborhood: str, limit: int = 5) -> dict:
+    """Best model deals in one neighborhood, ranked by deal score.
+
+    Args:
+        neighborhood: Neighborhood name, such as 'Chelsea'.
+        limit: How many deals to return, 1 to 25. Defaults to 5.
+    """
+    return get_deals.__wrapped__(neighborhood=neighborhood, limit=limit)
+
+
+@_tool
+def compare_neighborhoods(neighborhoods: str) -> dict:
+    """Compare listing counts and rents for two or more neighborhoods.
+
+    Args:
+        neighborhoods: Comma-separated names, such as 'Chelsea, Hell's Kitchen'.
+    """
+    names = []
+    for name in _split_names(neighborhoods):
+        resolved = _resolve_neighborhood(name)
+        if resolved not in names:
+            names.append(resolved)
+    if len(names) < 2:
+        raise ToolError("compare_neighborhoods needs at least 2 neighborhoods.")
+
+    summaries = []
+    for name in names:
+        rows = _query_rows(
+            "SELECT rent, sqft FROM listings WHERE neighborhood = ?",
+            (name,),
+        )
+        summaries.append({"neighborhood": name, **_price_stats(rows)})
+
+    priced = [row for row in summaries if row["median_rent"] is not None]
+    lowest = min(priced, key=lambda row: row["median_rent"])["neighborhood"] if priced else None
+    return {"neighborhoods": summaries, "lowest_median_rent": lowest}
+
+
+@_tool
+def summarize_neighborhood(neighborhood: str) -> dict:
+    """Price, bedroom mix, and most common amenities for one neighborhood.
+
+    Args:
+        neighborhood: Neighborhood name, such as 'Chelsea'.
+    """
+    name = _resolve_neighborhood(neighborhood)
+    rows = _query_rows(
+        "SELECT rent, sqft, beds FROM listings WHERE neighborhood = ?",
+        (name,),
+    )
+    bed_counts: dict = {}
+    for row in rows:
+        bed_counts[row["beds"]] = bed_counts.get(row["beds"], 0) + 1
+    bed_mix = [
+        {"beds": beds, "listings": count}
+        for beds, count in sorted(bed_counts.items(), key=lambda item: (item[0] is None, item[0] or 0))
+    ]
+    amenities = _query_rows(
+        """
+        SELECT a.amenity, COUNT(DISTINCT l.listing_id) AS units
+        FROM listings l
+        JOIN listing_amenities a ON l.listing_id = a.listing_id
+        WHERE l.neighborhood = ?
+        GROUP BY a.amenity
+        ORDER BY units DESC, a.amenity
+        LIMIT 8
+        """,
+        (name,),
+    )
+    return {"neighborhood": name, **_price_stats(rows), "bed_mix": bed_mix, "top_amenities": amenities}
+
+
+def _agent_tool(fn):
+    """Expose a crypto-style tool to the Agents SDK without hiding its __wrapped__ function."""
+    return function_tool(fn, strict_mode=False)
+
+
+ANALYSIS_TOOLS = [
+    _agent_tool(search_listings),
+    _agent_tool(get_building_amenities),
+    _agent_tool(get_deals),
+    _agent_tool(cheapest_in_neighborhood),
+    _agent_tool(best_deals_in_neighborhood),
+    _agent_tool(compare_neighborhoods),
+    _agent_tool(summarize_neighborhood),
+]

@@ -19,3 +19,6 @@ scripts/images
 
 # Chat history for the Text2SQL agent
 conversations.db
+
+# Saved listings for the chat page
+ui.db

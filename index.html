@@ -1,103 +1,47 @@
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NYC Deep Research Agent</title>
-    <style>
-        body {
-            font-family: system-ui, sans-serif;
-            max-width: 720px;
-            margin: 0 auto;
-            padding: 1rem;
-        }
-        #log {
-            display: flex;
-            flex-direction: column;
-            gap: 0.75rem;
-            min-height: 60vh;
-        }
-        .user, .assistant {
-            padding: 0.6rem 0.8rem;
-            border-radius: 8px;
-            white-space: pre-wrap;
-        }
-        .user {
-            align-self: flex-end;
-            max-width: 80%;
-            background: #e8f0fe;
-        }
-        .assistant {
-            background: #f4f4f5;
-        }
-        .tools {
-            color: #666;
-            font-size: 0.85rem;
-        }
-        form {
-            display: flex;
-            gap: 0.5rem;
-            align-items: flex-end;
-        }
-        textarea {
-            flex: 1;
-            font: inherit;
-            padding: 0.5rem;
-        }
-        button {
-            font: inherit;
-            padding: 0.5rem 0.8rem;
-        }
-    </style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Rental Analyst</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600&family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/chat.css?v=7">
 </head>
 <body>
-    <h1>NYC Deep Research Agent</h1>
-    <div id="log"></div>
-    <form id="form">
-        <textarea id="input" rows="2" placeholder="Ask for a plan in New York..."></textarea>
-        <button type="submit">Send</button>
-    </form>
-    <script>
-        const log = document.getElementById("log");
-        const input = document.getElementById("input");
-        const form = document.getElementById("form");
-        let sessionId = null;
-
-        function add(className, text) {
-            const div = document.createElement("div");
-            div.className = className;
-            div.textContent = text;
-            log.appendChild(div);
-            div.scrollIntoView();
-            return div;
-        }
-
-        form.addEventListener("submit", async (event) => {
-            event.preventDefault();
-            const text = input.value.trim();
-            if (!text) return;
-            input.value = "";
-            add("user", text);
-            const pending = add("assistant", "…");
-            try {
-                const res = await fetch("/chat", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ message: text, session_id: sessionId }),
-                });
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.detail || res.statusText);
-                sessionId = data.session_id;
-                const calls = data.tool_calls || [];
-                if (calls.length) {
-                    add("tools", "Tools: " + calls.map((call) => call.name).join(", "));
-                }
-                pending.textContent = data.response || "(no response)";
-            } catch (error) {
-                pending.textContent = "Error: " + error.message;
-            }
-            input.focus();
-        });
-    </script>
+    <div class="app">
+        <aside class="rail" id="rail">
+            <div class="brand">
+                <p class="brand-kicker">New York</p>
+                <h1>Rental Analyst</h1>
+            </div>
+            <div class="tabs" role="tablist" aria-label="Chats and saved listings">
+                <button type="button" role="tab" id="tab-chats" aria-selected="true" aria-controls="rail-body">Chats</button>
+                <button type="button" role="tab" id="tab-saved" aria-selected="false" aria-controls="rail-body">Saved</button>
+            </div>
+            <div class="rail-body" id="rail-body"></div>
+        </aside>
+        <div class="scrim" id="scrim" hidden></div>
+        <main class="main">
+            <header class="top">
+                <div class="wrap top-inner">
+                    <button type="button" class="btn btn-quiet menu" id="menu">Menu</button>
+                    <p class="top-title" id="top-title">New chat</p>
+                </div>
+            </header>
+            <div class="log-scroll" id="log-scroll">
+                <div class="wrap" id="log"></div>
+            </div>
+            <div class="composer">
+                <form class="wrap" id="form">
+                    <label class="sr" for="input">Message</label>
+                    <textarea id="input" rows="1" placeholder="Ask about a neighborhood, a rent, or a building"></textarea>
+                    <button type="submit" class="btn btn-primary" id="send">Send</button>
+                </form>
+            </div>
+        </main>
+    </div>
+    <script src="/static/chat.js?v=7"></script>
 </body>
 </html>

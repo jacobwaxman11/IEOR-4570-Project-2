@@ -461,7 +461,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-listings",
         type=int,
-        default=8,
+        default=100,
         help="Only score the first N listings in the queue (useful for testing)",
     )
     p.add_argument(
