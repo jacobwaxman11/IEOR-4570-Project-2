@@ -24,9 +24,25 @@ Usage from a notebook:
     # ... run models on the raw feature set, then:
     df2 = collapse_amenity_tiers(collapse_image_scores(df))
 
-Usage from the CLI (applies all transforms):
+Usage from the CLI (applies all transforms, fits an out-of-fold ridge on
+``log_rent``, and writes both tables into the database):
 
+    uv run features.py
     uv run features.py --output features.csv
+
+Tables written to ``--db``:
+
+    regression_features  — one row per scored listing: listing_id, log_rent,
+                           and every predictor the model saw
+    regression_results   — actual_rent, predicted_rent, percent_discount,
+                           deal_score (0–10)
+
+``percent_discount`` is ``100 * (predicted - actual) / predicted``. Positive
+means the unit is listed below the model. ``deal_score`` maps that onto
+0–10 with 5 = fairly priced: each 5 percentage points of discount moves the
+score by 1, clipped at 0 (at least 25% over the model) and 10 (at least 25%
+under). Predictions are out-of-fold so a listing is never scored by a model
+that trained on it.
 """
 
 from __future__ import annotations
@@ -34,14 +50,27 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
+import db as dbm
+
 
 DEFAULT_DB_PATH = "rentals.db"
+
+# Out-of-fold ridge on standardized predictors. Alpha is chosen from this
+# grid by out-of-fold RMSE on log_rent; the intercept is not penalized.
+_RIDGE_ALPHAS = (0.1, 1.0, 10.0, 100.0, 1000.0)
+_RIDGE_FOLDS = 5
+_RIDGE_SEED = 0
+
+# deal_score = clip(5 + percent_discount / _DEAL_POINTS_PER_SCORE, 0, 10)
+# so ±25 percentage points of discount lands on 10 and 0.
+_DEAL_POINTS_PER_SCORE = 5.0
 
 # Raw image-score columns loaded from listing_scores. These are collapsed
 # into two composites (apt_quality, common_quality) during engineering.
@@ -299,6 +328,176 @@ def prepare_features(
     return engineer_features(df, require_scores=require_scores, verbose=verbose)
 
 
+# ── Regression ───────────────────────────────────────────────────────────────
+
+
+def _feature_matrix(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Predictors and log_rent, in the frame's row order."""
+    cols = [c for c in df.columns if c not in ("listing_id", "log_rent")]
+    X = df[cols].to_numpy(dtype=float)
+    y = df["log_rent"].to_numpy(dtype=float)
+    return X, y
+
+
+def _ridge_predict_fold(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    """Standardize on the training fold, then ridge with a free intercept."""
+    mu = X_train.mean(axis=0)
+    sigma = X_train.std(axis=0)
+    sigma = np.where(sigma < 1e-12, 1.0, sigma)
+    Z_train = (X_train - mu) / sigma
+    Z_test = (X_test - mu) / sigma
+
+    n, p = Z_train.shape
+    A = np.empty((p + 1, p + 1), dtype=float)
+    A[0, 0] = n
+    A[0, 1:] = Z_train.sum(axis=0)
+    A[1:, 0] = A[0, 1:]
+    A[1:, 1:] = Z_train.T @ Z_train + alpha * np.eye(p)
+
+    rhs = np.empty(p + 1, dtype=float)
+    rhs[0] = y_train.sum()
+    rhs[1:] = Z_train.T @ y_train
+    beta = np.linalg.solve(A, rhs)
+    return beta[0] + Z_test @ beta[1:]
+
+
+def _oof_log_predictions(
+    X: np.ndarray,
+    y: np.ndarray,
+    alpha: float,
+    n_splits: int,
+) -> np.ndarray:
+    """Log-rent predictions where each row is scored by a model fit without it."""
+    n = len(y)
+    n_splits = min(n_splits, n)
+    if n_splits < 2:
+        return _ridge_predict_fold(X, y, X, alpha)
+
+    order = np.random.default_rng(_RIDGE_SEED).permutation(n)
+    folds = np.array_split(order, n_splits)
+    pred = np.empty(n, dtype=float)
+    for i, test in enumerate(folds):
+        train = np.concatenate([folds[j] for j in range(n_splits) if j != i])
+        pred[test] = _ridge_predict_fold(X[train], y[train], X[test], alpha)
+    return pred
+
+
+def _select_ridge(
+    X: np.ndarray, y: np.ndarray, n_splits: int
+) -> tuple[float, np.ndarray, int]:
+    """Pick the alpha with the lowest out-of-fold RMSE. Returns that alpha,
+    its out-of-fold log predictions, and the fold count actually used."""
+    folds = min(n_splits, len(y))
+    best_alpha = _RIDGE_ALPHAS[0]
+    best_pred = _oof_log_predictions(X, y, best_alpha, folds)
+    best_rmse = float(np.sqrt(np.mean((best_pred - y) ** 2)))
+    for alpha in _RIDGE_ALPHAS[1:]:
+        pred = _oof_log_predictions(X, y, alpha, folds)
+        rmse = float(np.sqrt(np.mean((pred - y) ** 2)))
+        if rmse < best_rmse:
+            best_alpha, best_pred, best_rmse = alpha, pred, rmse
+    return best_alpha, best_pred, folds
+
+
+def deal_score(percent_discount: np.ndarray) -> np.ndarray:
+    """Map percent discount onto 0–10. Fairly priced (0%) scores 5."""
+    score = 5.0 + np.asarray(percent_discount, dtype=float) / _DEAL_POINTS_PER_SCORE
+    return np.clip(np.round(score, 2), 0.0, 10.0)
+
+
+def predict_deals(df: pd.DataFrame, rents: pd.Series) -> pd.DataFrame:
+    """Predicted rent, percent discount, and deal score for each feature row.
+
+    ``rents`` is actual rent indexed by ``listing_id``. Predictions come from
+    an out-of-fold ridge on ``log_rent`` and are rounded to the nearest dollar
+    before the discount is computed, so the stored rents and the discount agree.
+    """
+    if "log_rent" not in df.columns or "listing_id" not in df.columns:
+        raise ValueError("feature frame must include listing_id and log_rent")
+
+    missing = set(df["listing_id"]) - set(rents.index)
+    if missing:
+        raise ValueError(f"{len(missing)} listings have features but no rent")
+
+    X, y = _feature_matrix(df)
+    alpha, log_pred, folds = _select_ridge(X, y, _RIDGE_FOLDS)
+
+    actual = rents.loc[df["listing_id"]].to_numpy(dtype=float)
+    predicted = np.maximum(np.rint(np.exp(log_pred)), 1.0)
+    percent_discount = np.round(100.0 * (predicted - actual) / predicted, 2)
+
+    model = f"ridge_log_rent_oof_k{folds}_alpha{alpha:g}"
+    scored_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return pd.DataFrame({
+        "listing_id": df["listing_id"].to_numpy(),
+        "actual_rent": actual.astype(int),
+        "predicted_rent": predicted.astype(int),
+        "percent_discount": percent_discount,
+        "deal_score": deal_score(percent_discount),
+        "model": model,
+        "scored_at": scored_at,
+    })
+
+
+def _load_rents(conn: sqlite3.Connection) -> pd.Series:
+    rents = pd.read_sql("SELECT listing_id, rent FROM listings", conn)
+    return rents.set_index("listing_id")["rent"]
+
+
+def save_regression(
+    conn: sqlite3.Connection,
+    features: pd.DataFrame,
+    results: pd.DataFrame,
+) -> None:
+    """Replace ``regression_features`` and ``regression_results`` with this run."""
+    features.to_sql("regression_features", conn, if_exists="replace", index=False)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_regression_features_listing "
+        "ON regression_features(listing_id)"
+    )
+    conn.execute("DELETE FROM regression_results")
+    conn.executemany(
+        """
+        INSERT INTO regression_results (
+            listing_id, actual_rent, predicted_rent, percent_discount,
+            deal_score, model, scored_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        list(results.itertuples(index=False, name=None)),
+    )
+
+
+def run_regression(
+    db_path: str = DEFAULT_DB_PATH,
+    *,
+    require_scores: bool = True,
+    raw: bool = False,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the feature frame, score deals, and write both tables.
+
+    Returns ``(features, results)``.
+    """
+    features = prepare_features(
+        db_path=db_path,
+        require_scores=require_scores,
+        verbose=verbose,
+    )
+    if not raw:
+        features = collapse_image_scores(features)
+        features = collapse_amenity_tiers(features)
+
+    with dbm.open_db(db_path) as conn:
+        results = predict_deals(features, _load_rents(conn))
+        save_regression(conn, features, results)
+    return features, results
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -327,6 +526,23 @@ def _save(df: pd.DataFrame, path: Path) -> None:
     print(f"Saved to {path}")
 
 
+def _summary_results(results: pd.DataFrame, db_path: str) -> None:
+    err = (results["predicted_rent"] - results["actual_rent"]).abs()
+    print(f"\nWrote regression_features and regression_results to {db_path}")
+    print(f"  model: {results['model'].iloc[0]}")
+    print(f"  listings scored: {len(results)}")
+    print(f"  MAE ${err.mean():,.0f}   median |error| ${err.median():,.0f}")
+    print("  best deals (deal_score, percent_discount, actual → predicted):")
+    top = results.sort_values(
+        ["deal_score", "percent_discount"], ascending=False
+    ).head(5)
+    for row in top.itertuples(index=False):
+        print(
+            f"    {row.deal_score:4.1f}   {row.percent_discount:+6.1f}%   "
+            f"${row.actual_rent:,.0f} → ${row.predicted_rent:,.0f}   {row.listing_id}"
+        )
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--db", default=DEFAULT_DB_PATH, help="SQLite database path")
@@ -338,16 +554,14 @@ def main() -> int:
                    help="Skip amenity-tier and image-composite transforms")
     args = p.parse_args()
 
-    df = prepare_features(
+    df, results = run_regression(
         db_path=args.db,
         require_scores=not args.include_unscored,
+        raw=args.raw,
     )
 
-    if not args.raw:
-        df = collapse_image_scores(df)
-        df = collapse_amenity_tiers(df)
-
     _summary(df)
+    _summary_results(results, args.db)
 
     if args.output:
         _save(df, Path(args.output))

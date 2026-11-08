@@ -13,3 +13,9 @@ __pycache__/
 
 # SQLite database
 scripts/rentals.db
+
+# Scraped images
+scripts/images
+
+# Chat history for the Text2SQL agent
+conversations.db

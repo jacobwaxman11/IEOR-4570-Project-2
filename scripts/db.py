@@ -4,11 +4,14 @@ The database is the single source of truth. Each script (scraper, backfill,
 scorer) reads/writes through the helpers here instead of through JSON files.
 
 Tables:
-  - listings           : one row per StreetEasy listing
-  - listing_amenities  : normalized amenity tags
-  - listing_images     : per-listing image references (positional)
-  - image_scores       : Gemini scores keyed by image_url (one per unique image)
-  - listing_scores     : aggregated scores per listing (rebuildable from image_scores)
+  - listings            : one row per StreetEasy listing
+  - listing_amenities   : normalized amenity tags
+  - listing_images      : per-listing image references (positional)
+  - image_scores        : Gemini scores keyed by image_url (one per unique image)
+  - listing_scores      : aggregated scores per listing (rebuildable from image_scores)
+  - regression_results  : predicted vs actual rent, percent discount, deal score
+  - regression_features : engineered training frame (created by features.py; columns
+                          follow the current feature set, so it is not declared here)
 
 Design notes:
   - `listing_id` is the canonical key (building_slug + unit).
@@ -131,6 +134,17 @@ CREATE TABLE IF NOT EXISTS listing_scores (
     space_type_counts_json  TEXT,
     aggregated_at           TEXT
 );
+
+CREATE TABLE IF NOT EXISTS regression_results (
+    listing_id        TEXT PRIMARY KEY REFERENCES listings(listing_id) ON DELETE CASCADE,
+    actual_rent       INTEGER NOT NULL,
+    predicted_rent    INTEGER NOT NULL,
+    percent_discount  REAL NOT NULL,  -- 100 * (predicted - actual) / predicted; >0 is underpriced
+    deal_score        REAL NOT NULL,  -- 0–10; 5 = fairly priced, 10 = at least 25% under the model
+    model             TEXT,
+    scored_at         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_regression_results_deal ON regression_results(deal_score);
 """
 
 
@@ -587,4 +601,17 @@ def stats(conn: sqlite3.Connection) -> dict:
         "image_refs": cnt("SELECT COUNT(*) FROM listing_images"),
         "unique_images": cnt("SELECT COUNT(DISTINCT image_url) FROM listing_images"),
         "scored_images": cnt("SELECT COUNT(*) FROM image_scores"),
+        "regression_results": cnt("SELECT COUNT(*) FROM regression_results"),
+        "regression_features": _count_if_table(conn, "regression_features"),
     }
+
+
+def _count_if_table(conn: sqlite3.Connection, name: str) -> int:
+    """``regression_features`` is created by features.py, so it may not exist yet."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone()
+    if not exists:
+        return 0
+    return conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]

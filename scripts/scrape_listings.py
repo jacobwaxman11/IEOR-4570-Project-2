@@ -457,10 +457,8 @@ def parse_args() -> argparse.Namespace:
         "--areas",
         type=str,
         # FULL LIST:
-        # Financial District, Tribeca, Stuyvesant Town/PCV, Gramercy Park, Chelsea
-        # Greenwich Village, East Village, Murray Hill, Sutton Place, Turtle Bay
-        # Kips Bay, Upper East Side, Hudson Yards, Hell's Kitchen, West Village, Flatiron, Nolita
-        default="104,105,106,113,115,116,117,157,158,162,133,130,131,132,152,146,140",
+        # Manhattan neighborhoods
+        default="103,104,105,106,107,108,109,110,112,113,115,116,117,120,121,122,123,124,135,139,147,148,149,150,153,157,158,162,226",
         help="Comma-separated StreetEasy area IDs",
     )
     p.add_argument(

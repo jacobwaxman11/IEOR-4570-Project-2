@@ -16,4 +16,5 @@ dependencies = [
     "pandas>=2.3.3",
     "numpy>=2.2.6",
     "google-genai>=2.24.0",
+    "openai-agents[litellm]>=0.23",
 ]
