@@ -79,6 +79,73 @@ function renderTable(lines) {
     return `<table><thead>${head}</thead><tbody>${rows}</tbody></table>`;
 }
 
+function indentOf(line) {
+    return line.match(/^[ \t]*/)[0].replace(/\t/g, "    ").length;
+}
+
+function listMatch(line) {
+    const match = line.match(/^([ \t]*)([-*]|\d+\.)[ \t]+(.*)$/);
+    if (!match) return null;
+    return {
+        indent: match[1].replace(/\t/g, "    ").length,
+        ordered: /\d/.test(match[2]),
+        text: match[3],
+    };
+}
+
+function dedentLines(lines) {
+    const widths = lines.filter((line) => line.trim()).map(indentOf);
+    const cut = widths.length ? Math.min(...widths) : 0;
+    return lines.map((line) => line.slice(cut)).join("\n").trim();
+}
+
+function readItem(lines, index) {
+    const first = listMatch(lines[index]);
+    const nested = [];
+    let cursor = index + 1;
+    while (cursor < lines.length) {
+        const line = lines[cursor];
+        if (!line.trim()) {
+            let look = cursor + 1;
+            while (look < lines.length && !lines[look].trim()) look += 1;
+            if (look >= lines.length) break;
+            const next = listMatch(lines[look]);
+            if (next && next.indent === first.indent && next.ordered === first.ordered) break;
+            if (indentOf(lines[look]) <= first.indent) break;
+            nested.push(line);
+            cursor += 1;
+            continue;
+        }
+        const next = listMatch(line);
+        if (next && next.indent === first.indent && next.ordered === first.ordered) break;
+        if (indentOf(line) <= first.indent) break;
+        nested.push(line);
+        cursor += 1;
+    }
+    return { first, nested, next: cursor };
+}
+
+function readList(lines, index) {
+    const opener = listMatch(lines[index]);
+    const items = [];
+    let cursor = index;
+    while (cursor < lines.length) {
+        if (!lines[cursor].trim()) {
+            let look = cursor + 1;
+            while (look < lines.length && !lines[look].trim()) look += 1;
+            const next = look < lines.length ? listMatch(lines[look]) : null;
+            if (!next || next.indent !== opener.indent || next.ordered !== opener.ordered) break;
+            cursor = look;
+        }
+        const item = listMatch(lines[cursor]);
+        if (!item || item.indent !== opener.indent || item.ordered !== opener.ordered) break;
+        const read = readItem(lines, cursor);
+        items.push(read);
+        cursor = read.next;
+    }
+    return { ordered: opener.ordered, items, next: cursor };
+}
+
 function renderMarkdown(source) {
     const fences = [];
     const text = String(source || "").replace(/```[^\n]*\n([\s\S]*?)```/g, (_, code) => {
@@ -117,24 +184,16 @@ function renderMarkdown(source) {
             index += 1;
             continue;
         }
-        if (/^\s*[-*]\s+/.test(line)) {
+        if (listMatch(line)) {
             flushParagraph();
-            const items = [];
-            while (index < lines.length && /^\s*[-*]\s+/.test(lines[index])) {
-                items.push(inline(lines[index].replace(/^\s*[-*]\s+/, "")));
-                index += 1;
-            }
-            html.push(`<ul>${items.map((item) => `<li>${item}</li>`).join("")}</ul>`);
-            continue;
-        }
-        if (/^\s*\d+\.\s+/.test(line)) {
-            flushParagraph();
-            const items = [];
-            while (index < lines.length && /^\s*\d+\.\s+/.test(lines[index])) {
-                items.push(inline(lines[index].replace(/^\s*\d+\.\s+/, "")));
-                index += 1;
-            }
-            html.push(`<ol>${items.map((item) => `<li>${item}</li>`).join("")}</ol>`);
+            const list = readList(lines, index);
+            index = list.next;
+            const tag = list.ordered ? "ol" : "ul";
+            const items = list.items.map((item) => {
+                const nested = item.nested.length ? renderMarkdown(dedentLines(item.nested)) : "";
+                return `<li>${inline(item.first.text)}${nested}</li>`;
+            });
+            html.push(`<${tag}>${items.join("")}</${tag}>`);
             continue;
         }
         if (/^\s*\|.+\|\s*$/.test(line)) {
@@ -426,6 +485,75 @@ function toolsFold(calls) {
     return details;
 }
 
+function listingNames(listing) {
+    return [listing.building, listing.unit ? `${listing.building || ""} #${listing.unit}` : ""]
+        .map((name) => String(name || "").trim().toLowerCase())
+        .filter((name) => name.length >= 6);
+}
+
+function mentionsListing(listing, text) {
+    const hay = text.toLowerCase();
+    return listingNames(listing).some((name) => hay.includes(name));
+}
+
+function blockListing(block, listings, used) {
+    const text = block.textContent || "";
+    const hits = listings.filter((listing) => !used.has(listing.listing_id) && mentionsListing(listing, text));
+    if (hits.length !== 1) return null;
+    const listing = hits[0];
+    const claimedBelow = [...block.querySelectorAll("li, p")].some((child) => {
+        const nested = listings.filter((item) => !used.has(item.listing_id) && mentionsListing(item, child.textContent || ""));
+        return nested.length === 1 && nested[0].listing_id === listing.listing_id;
+    });
+    return claimedBelow ? null : listing;
+}
+
+function mountInline(block, listing) {
+    if (block.tagName === "P") {
+        const host = el("div", block.className);
+        while (block.firstChild) host.append(block.firstChild);
+        block.replaceWith(host);
+        block = host;
+    }
+    const body = el("div", "unit-body");
+    const copy = el("div", "unit-copy");
+    const head = el("div", "unit-head");
+    const title = el("div", "unit-title");
+    while (block.firstChild) copy.append(block.firstChild);
+    while (copy.firstChild && copy.firstChild.nodeName !== "UL" && copy.firstChild.nodeName !== "OL") {
+        title.append(copy.firstChild);
+    }
+    head.append(title);
+    const view = viewLink(listing);
+    if (view) {
+        view.classList.add("btn-inline");
+        head.append(view);
+    }
+    head.append(heartButton(listing));
+    copy.prepend(head);
+    if (listing.image) {
+        const shot = photo(listing, true);
+        shot.classList.add("inline-photo");
+        shot.setAttribute("aria-label", listing.building ? `Photo of ${listing.building}` : "Listing photo");
+        body.append(shot);
+    }
+    body.append(copy);
+    block.classList.add("unit-line");
+    block.append(body);
+}
+
+function attachInlineListings(answer, listings) {
+    const used = new Set();
+    answer.querySelectorAll("li, p").forEach((block) => {
+        if (block.closest(".unit-line")) return;
+        const listing = blockListing(block, listings, used);
+        if (!listing) return;
+        used.add(listing.listing_id);
+        mountInline(block, listing);
+    });
+    return used;
+}
+
 function renderTurn(turn) {
     const section = el("article", "turn");
     if (turn.user) section.append(el("p", "user", turn.user));
@@ -443,7 +571,20 @@ function renderTurn(turn) {
     const answer = turn.response ? el("div", "answer") : null;
     if (answer) answer.innerHTML = renderMarkdown(turn.response);
     const listings = withSaved(turn.listings);
-    if (turn.display === "grid" && listings.length) {
+    const inline = listings.length > 1 && answer ? attachInlineListings(answer, listings) : new Set();
+    if (inline.size) {
+        section.append(answer);
+        const rest = listings.filter((listing) => !inline.has(listing.listing_id));
+        if (rest.length > 1) {
+            const row = el("div", "cards cards-inline");
+            rest.forEach((listing) => row.append(gridCard(listing)));
+            section.append(row);
+        } else if (rest.length === 1) {
+            section.append(featureCard(rest[0]));
+        }
+        return section;
+    }
+    if ((turn.display === "grid" || turn.display === "paired") && listings.length) {
         const split = el("div", "result-split");
         if (answer) split.append(answer);
         const grid = el("div", "cards");

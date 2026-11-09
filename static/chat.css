@@ -262,6 +262,56 @@ button, textarea, select { font: inherit; color: inherit; }
 .answer .md-h-4, .answer .md-h-5, .answer .md-h-6 { font-size: 1rem; }
 .answer ul, .answer ol { margin: 0 0 12px; padding-left: 1.2rem; }
 .answer li + li { margin-top: 4px; }
+.answer li.unit-line + li.unit-line { margin-top: 16px; }
+.answer ol:has(> li.unit-line) {
+    list-style: none;
+    padding-left: 0;
+    counter-reset: unit;
+}
+.answer li.unit-line {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    counter-increment: unit;
+}
+.answer li.unit-line::before {
+    content: counter(unit) ".";
+    flex: none;
+    width: 1.5rem;
+    padding-top: 2px;
+    font-variant-numeric: tabular-nums;
+}
+.unit-body {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    flex: 1;
+    min-width: 0;
+}
+.unit-copy {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.unit-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px 10px;
+}
+.unit-title { min-width: 0; }
+.answer .unit-copy ul,
+.answer .unit-copy ol { margin: 0; }
+.answer .inline-photo {
+    width: 112px;
+    height: 84px;
+    flex: none;
+    border-radius: 8px;
+    min-height: 0;
+}
+.answer .inline-photo img { height: 100%; }
 .answer a { color: var(--accent); }
 .answer code {
     font-family: var(--mono);
@@ -294,18 +344,28 @@ button, textarea, select { font: inherit; color: inherit; }
     vertical-align: top;
 }
 
-.result-split {
+.result-split, .result-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 300px;
     gap: 28px;
     align-items: start;
 }
 
+.paired { display: flex; flex-direction: column; gap: 22px; }
+.result-row .md-h:first-child { margin-top: 0; }
+
 .cards {
     display: flex;
     flex-direction: column;
     gap: 12px;
 }
+
+.cards-inline {
+    flex-direction: row;
+    flex-wrap: wrap;
+}
+
+.cards-inline .card { flex: 1 1 280px; }
 
 .card, .feature, .saved {
     background: var(--panel);
@@ -516,6 +576,12 @@ button, textarea, select { font: inherit; color: inherit; }
 
 .btn-primary { background: var(--accent); color: var(--accent-ink); }
 .btn-primary:hover { background: #1b382c; }
+.answer a.btn-inline {
+    color: var(--accent-ink);
+    white-space: nowrap;
+    padding: 5px 10px;
+    font-size: 13px;
+}
 
 .btn-secondary, .btn-quiet {
     background: transparent;
@@ -600,8 +666,9 @@ textarea {
 }
 
 @media (max-width: 1100px) {
-    .result-split { grid-template-columns: 1fr; }
+    .result-split, .result-row { grid-template-columns: 1fr; }
     .cards { display: grid; grid-template-columns: 1fr 1fr; }
+    .cards.cards-inline { display: flex; }
     .card {
         display: flex;
         flex-direction: column;

@@ -14,6 +14,8 @@ import requests
 from agents import ToolGuardrailFunctionOutput, function_tool, tool_input_guardrail
 from dotenv import load_dotenv
 
+from scripts import bq
+
 load_dotenv()
 
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
@@ -476,11 +478,65 @@ def _describe(table: str, name: str, sql_type: str) -> str:
 
 
 def _enum_candidate(name: str, sql_type: str) -> bool:
-    if (sql_type or "").upper() != "TEXT":
+    if (sql_type or "").upper() not in {"TEXT", "STRING"}:
         return False
     if name in _NON_ENUM or name.lower().endswith(("_at", "_json", "_url", "_path")):
         return False
     return True
+
+
+def _load_columns_bq() -> list[dict]:
+    """Column catalog from BigQuery. Chat history and favorites stay out of it,
+    the same way the local app only opens rentals.db.
+    """
+    project, dataset = bq.project(), bq.dataset()
+    listed = bq.query_dicts(
+        f"""
+        SELECT table_name, column_name, data_type
+        FROM `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS`
+        ORDER BY table_name, ordinal_position
+        """
+    )
+    columns = []
+    for info in listed:
+        table, name, sql_type = info["table_name"], info["column_name"], info["data_type"]
+        if table not in bq.RENTAL_TABLES:
+            continue
+        column = {
+            "table": table,
+            "name": name,
+            "type": sql_type,
+            "description": _describe(table, name, sql_type),
+        }
+        columns.append(column)
+    _fill_enums_bq(columns)
+    return columns
+
+
+def _fill_enums_bq(columns: list[dict]) -> None:
+    """One query per table for enum values. A query per column would run before
+    the process can listen, and Cloud Run would time out the startup check.
+    """
+    by_table: dict[str, list[dict]] = {}
+    for column in columns:
+        if _enum_candidate(column["name"], column["type"]):
+            by_table.setdefault(column["table"], []).append(column)
+    for table, candidates in by_table.items():
+        parts = []
+        for column in candidates:
+            quoted = bq.quote_ident(column["name"])
+            literal = column["name"].replace("'", "''")
+            parts.append(
+                f"SELECT '{literal}' AS column_name, CAST({quoted} AS STRING) AS v "
+                f"FROM {bq.quote_ident(table)} WHERE {quoted} IS NOT NULL"
+            )
+        grouped: dict[str, set] = {column["name"]: set() for column in candidates}
+        for row in bq.query_dicts(" UNION ALL ".join(parts)):
+            grouped[row["column_name"]].add(row["v"])
+        for column in candidates:
+            values = grouped[column["name"]]
+            if 0 < len(values) <= MAX_ENUM_VALUES:
+                column["enum_values"] = sorted(values, key=lambda value: (value is None, str(value)))
 
 
 def _open_db() -> sqlite3.Connection:
@@ -524,10 +580,26 @@ def _load_columns(conn: sqlite3.Connection) -> list[dict]:
     return columns
 
 
-_db = _open_db()
 _db_lock = threading.Lock()
-with _db_lock:
-    COLUMNS = _load_columns(_db)
+_db = None
+_columns: list[dict] | None = None
+
+
+def _sqlite() -> sqlite3.Connection:
+    global _db
+    if _db is None:
+        _db = _open_db()
+    return _db
+
+
+def _columns_list() -> list[dict]:
+    """Load the catalog on first use so the server can bind $PORT first."""
+    global _columns
+    if _columns is None:
+        with _db_lock:
+            if _columns is None:
+                _columns = _load_columns_bq() if bq.prod() else _load_columns(_sqlite())
+    return _columns
 
 
 def _read_mappings() -> str:
@@ -539,7 +611,7 @@ def _read_mappings() -> str:
             "description": column["description"],
             "is_enum": "enum_values" in column,
         }
-        for column in COLUMNS
+        for column in _columns_list()
     ])
 
 
@@ -553,7 +625,7 @@ def _split_column(column: str) -> tuple[str | None, str]:
 def _get_enum_values(column: str) -> str:
     table, name = _split_column(column.strip())
     if table is not None:
-        match = next((c for c in COLUMNS if c["table"] == table and c["name"] == name), None)
+        match = next((c for c in _columns_list() if c["table"] == table and c["name"] == name), None)
         if match is None:
             return json.dumps({"error": f"No column '{column}'. Call read_mappings for the columns."})
         if "enum_values" not in match:
@@ -563,7 +635,7 @@ def _get_enum_values(column: str) -> str:
             default=str,
         )
 
-    matches = [c for c in COLUMNS if c["name"] == name]
+    matches = [c for c in _columns_list() if c["name"] == name]
     if not matches:
         return json.dumps({"error": f"No column '{column}'. Call read_mappings for the columns."})
     if len(matches) > 1:
@@ -593,9 +665,22 @@ def _is_read_only(query: str) -> bool:
 
 def _run_sql(query: str) -> str:
     """The SDK runs tools on worker threads. One lock keeps the shared connection safe."""
+    if bq.prod():
+        try:
+            columns, rows = bq.query(query, max_rows=MAX_ROWS + 1)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        return json.dumps(
+            {
+                "columns": columns,
+                "rows": rows[:MAX_ROWS],
+                "truncated": len(rows) > MAX_ROWS,
+            },
+            default=str,
+        )
     with _db_lock:
         try:
-            cursor = _db.execute(query)
+            cursor = _sqlite().execute(query)
             rows = cursor.fetchmany(MAX_ROWS + 1)
             columns = [desc[0] for desc in cursor.description or []]
         except sqlite3.Error as e:
@@ -643,7 +728,7 @@ def read_only_sql(data) -> ToolGuardrailFunctionOutput:
 
 @function_tool(tool_input_guardrails=[read_only_sql])
 def run_sql(query: str) -> str:
-    """Run one read-only SQLite query against the rental database and return the rows.
+    """Run one read-only query against the rental database and return the rows.
 
     Args:
         query: A single SELECT or WITH query.
@@ -659,9 +744,14 @@ def run_sql(query: str) -> str:
 
 def _query_rows(sql: str, params: tuple = ()) -> list[dict]:
     """Run a parameterized read and return dict rows. Names stay out of the SQL text."""
+    if bq.prod():
+        try:
+            return bq.query_dicts(sql, params)
+        except Exception as e:
+            raise ToolError(str(e)) from e
     with _db_lock:
         try:
-            cursor = _db.execute(sql, params)
+            cursor = _sqlite().execute(sql, params)
             columns = [desc[0] for desc in cursor.description or []]
             rows = cursor.fetchall()
         except sqlite3.Error as e:
@@ -671,7 +761,7 @@ def _query_rows(sql: str, params: tuple = ()) -> list[dict]:
 
 def _neighborhoods() -> list[str]:
     match = next(
-        (c for c in COLUMNS if c["table"] == "listings" and c["name"] == "neighborhood"),
+        (c for c in _columns_list() if c["table"] == "listings" and c["name"] == "neighborhood"),
         None,
     )
     values = (match or {}).get("enum_values")
@@ -863,9 +953,12 @@ def get_building_amenities(building: str) -> dict:
 
     found = matches("lower(name) = lower(?) OR lower(building_slug) = lower(?)")
     if not found:
-        found = matches(
-            "instr(lower(name), lower(?)) > 0 OR instr(lower(building_slug), lower(?)) > 0"
+        fuzzy = (
+            "STRPOS(LOWER(name), LOWER(?)) > 0 OR STRPOS(LOWER(building_slug), LOWER(?)) > 0"
+            if bq.prod()
+            else "instr(lower(name), lower(?)) > 0 OR instr(lower(building_slug), lower(?)) > 0"
         )
+        found = matches(fuzzy)
     if not found:
         raise ToolError(f"No building matching '{building}'.")
     if len(found) > 1:

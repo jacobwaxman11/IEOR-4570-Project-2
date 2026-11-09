@@ -470,6 +470,9 @@ def save_regression(
         """,
         list(results.itertuples(index=False, name=None)),
     )
+    import bq
+
+    bq.replace_regression(features, results)
 
 
 def run_regression(

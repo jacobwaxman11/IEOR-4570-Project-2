@@ -10,7 +10,6 @@ from agents import (
     ModelSettings,
     Runner,
     RunHooks,
-    SQLiteSession,
     set_tracing_disabled,
 )
 from agents.extensions.models.litellm_model import LitellmModel
@@ -20,8 +19,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from present import (
-    IMAGES_DIR,
-    SESSIONS_DB,
     STATIC_DIR,
     add_favorite,
     cards_for,
@@ -32,6 +29,8 @@ from present import (
     remove_favorite,
     resolve_display,
 )
+from scripts import bq
+from session_store import open_session
 from tools import ANALYSIS_TOOLS, get_enum_values, read_mappings, run_sql
 
 # Traces upload to OpenAI by default, which needs an OpenAI key. We're on Gemini.
@@ -39,9 +38,7 @@ set_tracing_disabled(True)
 
 # --- The Agent ---
 
-agent = Agent(
-    name="NYC Rental Analyst",
-    instructions="""\
+_INSTRUCTIONS = """\
 You are a data analyst. Answer questions about NYC rental listings.
 The data is in a SQLite database. `listings` has one row per StreetEasy listing.
 Related tables join on the keys below.
@@ -111,7 +108,19 @@ WHERE neighborhood IN ('Chelsea', 'Hell''s Kitchen')
   AND rent IS NOT NULL
 GROUP BY neighborhood
 ORDER BY avg_rent;
-""",
+"""
+
+if bq.prod():
+    _INSTRUCTIONS = _INSTRUCTIONS.replace(
+        "The data is in a SQLite database.",
+        "The data is in BigQuery Standard SQL. Do not double-quote identifiers. "
+        "Quote an identifier that contains an apostrophe or a space with backticks.",
+        1,
+    )
+
+agent = Agent(
+    name="NYC Rental Analyst",
+    instructions=_INSTRUCTIONS,
     model=LitellmModel(model="vertex_ai/gemini-3.8-flash", api_key="unused"),
     model_settings=ModelSettings(extra_args={"vertex_location": "global"}),
     tools=[read_mappings, get_enum_values, run_sql, *ANALYSIS_TOOLS],
@@ -205,10 +214,10 @@ def index():
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    # Get or create the session. A new SQLiteSession on the same file sees the same history.
+    # Get or create the session. A new session on the same id sees the same history.
     # Events stream as the tools run, so the page can show each step before the answer exists.
     session_id = request.session_id or str(uuid.uuid4())
-    session = SQLiteSession(session_id, str(SESSIONS_DB))
+    session = open_session(session_id)
     hooks = RecordToolCalls()
 
     async def run():
@@ -226,7 +235,7 @@ async def chat(request: ChatRequest):
             # Keep the calls that already finished so the page can still show those steps.
             response = f"Model call failed: {type(e).__name__}: {str(e)[:300]}"
             tool_calls = hooks.tool_calls
-        presented = resolve_display(request.message, tool_calls)
+        presented = resolve_display(request.message, tool_calls, response)
         await hooks.events.put({
             "type": "done",
             "response": response,
@@ -298,12 +307,10 @@ def unfavorite(listing_id: str):
 @app.post("/clear")
 async def clear(session_id: str | None = None):
     if session_id:
-        await SQLiteSession(session_id, str(SESSIONS_DB)).clear_session()
+        await open_session(session_id).clear_session()
     return {"status": "ok"}
 
 
-if IMAGES_DIR.is_dir():
-    app.mount("/media", StaticFiles(directory=IMAGES_DIR), name="media")
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

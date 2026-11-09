@@ -13,10 +13,14 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
+
+from google.api_core.exceptions import GoogleAPICallError
+
+from scripts import bq
 
 ROOT = Path(__file__).parent
 RENTALS_DB = ROOT / "scripts" / "rentals.db"
-IMAGES_DIR = ROOT / "scripts" / "images"
 SESSIONS_DB = ROOT / "conversations.db"
 UI_DB = ROOT / "ui.db"
 STATIC_DIR = ROOT / "static"
@@ -61,6 +65,8 @@ _ui_lock = threading.Lock()
 
 
 def init_ui() -> None:
+    if bq.prod():
+        return
     with _ui_lock:
         conn = sqlite3.connect(UI_DB)
         try:
@@ -96,14 +102,32 @@ def _sessions():
     return conn
 
 
-def favorite_ids() -> set[str]:
-    if not UI_DB.exists():
-        return set()
-    conn = _ui()
+def _rentals_ready() -> bool:
+    return bq.prod() or RENTALS_DB.exists()
+
+
+def _ui_ready() -> bool:
+    return bq.prod() or UI_DB.exists()
+
+
+def _sessions_ready() -> bool:
+    return bq.prod() or SESSIONS_DB.exists()
+
+
+def _rows(connect, sql: str, params: tuple | list = ()) -> list[dict]:
+    if bq.prod():
+        return bq.query_dicts(sql, params)
+    conn = connect()
     try:
-        return {row["listing_id"] for row in conn.execute("SELECT listing_id FROM favorites")}
+        return [dict(row) for row in conn.execute(sql, params)]
     finally:
         conn.close()
+
+
+def favorite_ids() -> set[str]:
+    if not _ui_ready():
+        return set()
+    return {row["listing_id"] for row in _rows(_ui, "SELECT listing_id FROM favorites")}
 
 
 def _clip(text, limit: int = 320) -> str | None:
@@ -117,19 +141,16 @@ def _clip(text, limit: int = 320) -> str | None:
     return text[: limit - 1].rstrip() + "…"
 
 
-def _image_src(local_path: str | None) -> str | None:
-    if not local_path:
+def _photo_url(url: str | None) -> str | None:
+    """Card image. Local files are only for scoring; the page uses the CDN link."""
+    if not url:
         return None
-    rel = str(local_path).replace("\\", "/").lstrip("/")
-    if rel.startswith("images/"):
-        rel = rel[len("images/") :]
-    root = IMAGES_DIR.resolve()
-    full = (root / rel).resolve()
-    if not str(full).startswith(str(root) + "/") and full != root:
+    parsed = urlparse(str(url).strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return None
-    if not full.is_file():
+    if parsed.netloc.lower() == "undefined":
         return None
-    return "/media/" + rel
+    return parsed.geturl()
 
 
 def _number(value):
@@ -145,32 +166,29 @@ def _number(value):
 
 
 def _cards(ids: list[str], saved: set[str] | None = None) -> list[dict]:
-    if not ids or not RENTALS_DB.exists():
+    if not ids or not _rentals_ready():
         return []
     saved = favorite_ids() if saved is None else saved
     placeholders = ",".join("?" * len(ids))
-    conn = _rentals()
-    try:
-        rows = conn.execute(
+    rows = _rows(
+        _rentals,
             f"""
             SELECT l.listing_id, l.name AS building, l.unit, l.neighborhood,
                    l.beds, l.baths, l.sqft, l.rent, l.url, l.listing_status,
                    l.description, r.deal_score,
                    (
-                       SELECT i.local_image_path
+                       SELECT i.image_url
                        FROM listing_images i
                        WHERE i.listing_id = l.listing_id
                        ORDER BY i.position
                        LIMIT 1
-                   ) AS image_path
+                   ) AS image_url
             FROM listings l
             LEFT JOIN regression_results r ON r.listing_id = l.listing_id
             WHERE l.listing_id IN ({placeholders})
             """,
             ids,
-        ).fetchall()
-    finally:
-        conn.close()
+    )
     by_id = {row["listing_id"]: row for row in rows}
     cards = []
     for listing_id in ids:
@@ -190,7 +208,7 @@ def _cards(ids: list[str], saved: set[str] | None = None) -> list[dict]:
             "rent": _number(row["rent"]),
             "url": link,
             "deal_score": _number(row["deal_score"]),
-            "image": _image_src(row["image_path"]),
+            "image": _photo_url(row["image_url"]),
             "description": _clip(row["description"]),
             "favorited": listing_id in saved,
         })
@@ -265,48 +283,47 @@ def _refs_from_call(call: dict) -> list[dict]:
 
 
 def _resolve_refs(refs: list[dict]) -> list[str]:
-    if not refs or not RENTALS_DB.exists():
+    if not refs or not _rentals_ready():
         return []
     wanted_ids = [ref["listing_id"] for ref in refs if ref.get("listing_id")]
     wanted_urls = [ref["url"] for ref in refs if ref.get("url")]
     pairs = [(ref["name"], ref["unit"]) for ref in refs if ref.get("name") and ref.get("unit") is not None]
-    conn = _rentals()
-    try:
-        known = set()
-        if wanted_ids:
-            marks = ",".join("?" * len(wanted_ids))
-            known = {
-                row["listing_id"]
-                for row in conn.execute(
-                    f"SELECT listing_id FROM listings WHERE listing_id IN ({marks})",
-                    wanted_ids,
-                )
-            }
-        url_map = {}
-        if wanted_urls:
-            marks = ",".join("?" * len(wanted_urls))
-            url_map = {
-                row["url"]: row["listing_id"]
-                for row in conn.execute(
-                    f"SELECT listing_id, url FROM listings WHERE url IN ({marks})",
-                    wanted_urls,
-                )
-            }
-        pair_map = {}
-        for building, unit in pairs:
-            row = conn.execute(
-                """
-                SELECT listing_id FROM listings
-                WHERE lower(name) = lower(?) AND lower(unit) = lower(?)
-                ORDER BY listing_id
-                LIMIT 1
-                """,
-                (building, unit),
-            ).fetchone()
-            if row is not None:
-                pair_map[(building.casefold(), unit.casefold())] = row["listing_id"]
-    finally:
-        conn.close()
+    known = set()
+    if wanted_ids:
+        marks = ",".join("?" * len(wanted_ids))
+        known = {
+            row["listing_id"]
+            for row in _rows(
+                _rentals,
+                f"SELECT listing_id FROM listings WHERE listing_id IN ({marks})",
+                wanted_ids,
+            )
+        }
+    url_map = {}
+    if wanted_urls:
+        marks = ",".join("?" * len(wanted_urls))
+        url_map = {
+            row["url"]: row["listing_id"]
+            for row in _rows(
+                _rentals,
+                f"SELECT listing_id, url FROM listings WHERE url IN ({marks})",
+                wanted_urls,
+            )
+        }
+    pair_map = {}
+    for building, unit in pairs:
+        found = _rows(
+            _rentals,
+            """
+            SELECT listing_id FROM listings
+            WHERE lower(name) = lower(?) AND lower(unit) = lower(?)
+            ORDER BY listing_id
+            LIMIT 1
+            """,
+            (building, unit),
+        )
+        if found:
+            pair_map[(building.casefold(), unit.casefold())] = found[0]["listing_id"]
 
     ordered = []
     seen = set()
@@ -343,23 +360,20 @@ def _superlative(question: str) -> str | None:
     return None
 
 
-def _metrics(ids: list[str]) -> dict[str, sqlite3.Row]:
-    if not ids:
+def _metrics(ids: list[str]) -> dict[str, dict]:
+    if not ids or not _rentals_ready():
         return {}
     marks = ",".join("?" * len(ids))
-    conn = _rentals()
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT l.listing_id, l.unit, l.rent, r.deal_score
-            FROM listings l
-            LEFT JOIN regression_results r ON r.listing_id = l.listing_id
-            WHERE l.listing_id IN ({marks})
-            """,
-            ids,
-        ).fetchall()
-    finally:
-        conn.close()
+    rows = _rows(
+        _rentals,
+        f"""
+        SELECT l.listing_id, l.unit, l.rent, r.deal_score
+        FROM listings l
+        LEFT JOIN regression_results r ON r.listing_id = l.listing_id
+        WHERE l.listing_id IN ({marks})
+        """,
+        ids,
+    )
     return {row["listing_id"]: row for row in rows}
 
 
@@ -409,7 +423,24 @@ def _choose_single(question: str, groups: list[list[str]]) -> str:
     return ranked[0]
 
 
-def resolve_display(question: str, tool_calls: list[dict]) -> dict:
+def _mentioned(answer: str, cards: list[dict]) -> list[dict]:
+    """Listings whose name the written answer actually uses, in that order."""
+    folded = (answer or "").casefold()
+    if not folded:
+        return []
+    found = []
+    for card in cards:
+        name = str(card.get("building") or "").strip()
+        if len(name) < 6:
+            continue
+        at = folded.find(name.casefold())
+        if at >= 0:
+            found.append((at, card))
+    found.sort(key=lambda item: item[0])
+    return [card for _, card in found]
+
+
+def resolve_display(question: str, tool_calls: list[dict], answer: str | None = None) -> dict:
     """Decide the card layout for one turn and load the listing cards."""
     groups = []
     try:
@@ -427,12 +458,17 @@ def resolve_display(question: str, tool_calls: list[dict]) -> dict:
                 if listing_id not in seen:
                     seen.add(listing_id)
                     unique.append(listing_id)
+        named = _mentioned(answer or "", _cards(unique))
+        # A singular question can still be answered with several apartments.
+        # Show a card for each one the reply names.
+        if len(named) >= 2:
+            return {"display": "paired", "listings": named}
         single = mode == "single" or (mode == "auto" and len(unique) == 1)
         if single:
-            cards = _cards([_choose_single(question, groups)])
+            cards = named or _cards([_choose_single(question, groups)])
             if not cards:
                 return {"display": "none", "listings": []}
-            return {"display": "single", "listings": cards}
+            return {"display": "single", "listings": cards[:1]}
         largest = max(groups, key=len)
         # A later set of the same size is the refined search.
         for group in groups:
@@ -442,7 +478,7 @@ def resolve_display(question: str, tool_calls: list[dict]) -> dict:
         if not cards:
             return {"display": "none", "listings": []}
         return {"display": "grid", "listings": cards}
-    except sqlite3.Error:
+    except (sqlite3.Error, GoogleAPICallError):
         return {"display": "none", "listings": []}
 
 
@@ -461,16 +497,13 @@ def _text_content(content) -> str:
 
 
 def _load_items(session_id: str) -> list[dict]:
-    if not SESSIONS_DB.exists():
+    if not _sessions_ready():
         return []
-    conn = _sessions()
-    try:
-        rows = conn.execute(
-            "SELECT message_data FROM agent_messages WHERE session_id = ? ORDER BY id",
-            (session_id,),
-        ).fetchall()
-    finally:
-        conn.close()
+    rows = _rows(
+        _sessions,
+        "SELECT message_data FROM agent_messages WHERE session_id = ? ORDER BY id",
+        (session_id,),
+    )
     items = []
     for row in rows:
         try:
@@ -489,7 +522,7 @@ def _turns(items: list[dict]) -> list[dict]:
         nonlocal current
         if current is None:
             return
-        presented = resolve_display(current["user"], current["tool_calls"])
+        presented = resolve_display(current["user"], current["tool_calls"], current["response"])
         turns.append({
             "user": current["user"],
             "response": current["response"],
@@ -547,20 +580,17 @@ def _title_from(text: str) -> str:
 
 
 def list_threads() -> list[dict]:
-    if not SESSIONS_DB.exists():
+    if not _sessions_ready():
         return []
-    conn = _sessions()
-    try:
-        rows = conn.execute(
-            """
-            SELECT s.session_id, s.updated_at, m.message_data
-            FROM agent_sessions s
-            JOIN agent_messages m ON m.session_id = s.session_id
-            ORDER BY s.updated_at DESC, m.id ASC
-            """
-        ).fetchall()
-    finally:
-        conn.close()
+    rows = _rows(
+        _sessions,
+        """
+        SELECT s.session_id, s.updated_at, m.message_data
+        FROM agent_sessions s
+        JOIN agent_messages m ON m.session_id = s.session_id
+        ORDER BY s.updated_at DESC, m.id ASC
+        """,
+    )
     threads = []
     seen = set()
     titles: dict[str, str] = {}
@@ -590,17 +620,14 @@ def list_threads() -> list[dict]:
 
 
 def load_thread(session_id: str) -> dict | None:
-    if not SESSIONS_DB.exists():
+    if not _sessions_ready():
         return None
-    conn = _sessions()
-    try:
-        row = conn.execute(
-            "SELECT session_id FROM agent_sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-    finally:
-        conn.close()
-    if row is None:
+    found = _rows(
+        _sessions,
+        "SELECT session_id FROM agent_sessions WHERE session_id = ?",
+        (session_id,),
+    )
+    if not found:
         return None
     turns = _turns(_load_items(session_id))
     title = _title_from(next((turn["user"] for turn in turns if turn["user"]), ""))
@@ -613,16 +640,12 @@ def _missing_last(value):
 
 def list_favorites(sort: str) -> dict:
     chosen = sort if sort in SORTS else "recent"
-    if not UI_DB.exists() or not RENTALS_DB.exists():
+    if not _ui_ready() or not _rentals_ready():
         return {"sort": chosen, "listings": []}
-    conn = _ui()
-    try:
-        stamps = {
-            row["listing_id"]: row["favorited_at"]
-            for row in conn.execute("SELECT listing_id, favorited_at FROM favorites")
-        }
-    finally:
-        conn.close()
+    stamps = {
+        row["listing_id"]: row["favorited_at"]
+        for row in _rows(_ui, "SELECT listing_id, favorited_at FROM favorites")
+    }
     if not stamps:
         return {"sort": chosen, "listings": []}
     cards = _cards(list(stamps), saved=set(stamps))
@@ -654,24 +677,29 @@ def add_favorite(listing_id: str) -> dict | None:
     if not cards:
         return None
     stamp = datetime.now(timezone.utc).isoformat()
-    with _ui_lock:
-        conn = _ui()
-        try:
-            conn.execute(
-                """
-                INSERT INTO favorites (listing_id, favorited_at) VALUES (?, ?)
-                ON CONFLICT(listing_id) DO UPDATE SET favorited_at = excluded.favorited_at
-                """,
-                (listing_id, stamp),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+    if bq.prod():
+        bq.upsert_favorite(listing_id, stamp)
+    else:
+        with _ui_lock:
+            conn = _ui()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO favorites (listing_id, favorited_at) VALUES (?, ?)
+                    ON CONFLICT(listing_id) DO UPDATE SET favorited_at = excluded.favorited_at
+                    """,
+                    (listing_id, stamp),
+                )
+                conn.commit()
+            finally:
+                conn.close()
     cards[0]["favorited"] = True
     return cards[0]
 
 
 def remove_favorite(listing_id: str) -> bool:
+    if bq.prod():
+        return bq.delete_favorite(listing_id)
     if not UI_DB.exists():
         return False
     with _ui_lock:

@@ -1,7 +1,8 @@
 """SQLite schema + helpers for the NYCRentalRankings dataset.
 
-The database is the single source of truth. Each script (scraper, backfill,
-scorer) reads/writes through the helpers here instead of through JSON files.
+Scripts read and write this file. Each write is also mirrored to BigQuery
+unless ``BQ_MIRROR=0``. The chat app reads this file when ``APP_ENV`` is
+``local``, and reads BigQuery when ``APP_ENV=prod``.
 
 Tables:
   - listings            : one row per StreetEasy listing
@@ -220,6 +221,16 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _mirror(action) -> None:
+    """Send a successful SQLite write to BigQuery. Import is local so opening
+    a SQLite file does not require the BigQuery client until a write happens.
+    """
+    import bq
+
+    if bq.mirror_enabled():
+        action(bq)
+
+
 # ── listings ──────────────────────────────────────────────────────────────────
 
 LISTING_COLS = (
@@ -236,6 +247,7 @@ def upsert_listing(conn: sqlite3.Connection, listing: dict) -> None:
     values = [listing.get(c) for c in LISTING_COLS]
     placeholders = ",".join("?" * len(LISTING_COLS))
     cols = ",".join(LISTING_COLS)
+    now = _utcnow()
 
     set_clause = ",".join(f"{c}=excluded.{c}" for c in LISTING_COLS if c != "listing_id")
 
@@ -245,8 +257,9 @@ def upsert_listing(conn: sqlite3.Connection, listing: dict) -> None:
         VALUES ({placeholders}, ?, ?)
         ON CONFLICT(listing_id) DO UPDATE SET {set_clause}
         """,
-        values + [_utcnow(), _utcnow()],
+        values + [now, now],
     )
+    _mirror(lambda remote: remote.mirror_upsert_listing(listing, now))
 
 
 def update_listing_fields(
@@ -260,6 +273,7 @@ def update_listing_fields(
         f"UPDATE listings SET {cols} WHERE listing_id=?",
         list(fields.values()) + [listing_id],
     )
+    _mirror(lambda remote: remote.mirror_update_listing(listing_id, fields))
 
 
 def listings_due_for_refresh(
@@ -304,10 +318,7 @@ def refresh_listing_market(
 
 
 def mark_detail_fetched(conn: sqlite3.Connection, listing_id: str) -> None:
-    conn.execute(
-        "UPDATE listings SET detail_fetched_at=? WHERE listing_id=?",
-        (_utcnow(), listing_id),
-    )
+    update_listing_fields(conn, listing_id, {"detail_fetched_at": _utcnow()})
 
 
 def get_listing(conn: sqlite3.Connection, listing_id: str) -> Optional[dict]:
@@ -362,6 +373,7 @@ def set_amenities(
             "INSERT OR IGNORE INTO listing_amenities (listing_id, amenity) VALUES (?, ?)",
             rows,
         )
+    _mirror(lambda remote: remote.replace_amenities(listing_id, [amenity for _, amenity in rows]))
 
 
 def get_amenities(conn: sqlite3.Connection, listing_id: str) -> list[str]:
@@ -401,6 +413,8 @@ def set_listing_images(
             "VALUES (?, ?, ?, ?)",
             rows,
         )
+    stored_paths = [row[3] for row in rows]
+    _mirror(lambda remote: remote.replace_images(listing_id, list(image_urls), stored_paths))
 
 
 def listings_needing_image_download(conn: sqlite3.Connection) -> list[str]:
@@ -469,6 +483,21 @@ def upsert_image_score(
     # object is populated. apt and com are mutually exclusive per the schema.
     finish = apt.get("finish_quality") if apt else com.get("finish_quality")
     cond = apt.get("condition") if apt else com.get("condition")
+    row = {
+        "image_url": image_url,
+        "image_category": score.get("image_category"),
+        "room_type": apt.get("room_type"),
+        "natural_light": apt.get("natural_light"),
+        "space_feeling": apt.get("space_feeling"),
+        "view_quality": apt.get("view_quality"),
+        "space_type": com.get("space_type"),
+        "appeal": com.get("appeal"),
+        "finish_quality": finish,
+        "condition_score": cond,
+        "irrelevant_reason": score.get("irrelevant_reason"),
+        "model": model,
+        "scored_at": _utcnow(),
+    }
 
     conn.execute(
         """
@@ -481,22 +510,16 @@ def upsert_image_score(
             model, scored_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            image_url,
-            score.get("image_category"),
-            apt.get("room_type"),
-            apt.get("natural_light"),
-            apt.get("space_feeling"),
-            apt.get("view_quality"),
-            com.get("space_type"),
-            com.get("appeal"),
-            finish,
-            cond,
-            score.get("irrelevant_reason"),
-            model,
-            _utcnow(),
-        ),
+        tuple(row[name] for name in (
+            "image_url", "image_category",
+            "room_type", "natural_light", "space_feeling", "view_quality",
+            "space_type", "appeal",
+            "finish_quality", "condition_score",
+            "irrelevant_reason",
+            "model", "scored_at",
+        )),
     )
+    _mirror(lambda remote: remote.mirror_image_score(row))
 
 
 def image_score_to_dict(row: dict) -> dict:
@@ -547,27 +570,37 @@ def upsert_listing_scores(
     apt = summary.get("apartment") or {}
     com = summary.get("common_space") or {}
 
-    values = (
-        listing_id,
-        apt.get("avg_natural_light"),
-        apt.get("avg_finish_quality"),
-        apt.get("avg_space_feeling"),
-        apt.get("avg_condition"),
-        apt.get("max_view_quality"),
-        apt.get("pct_bright_rooms"),
-        1 if apt.get("has_good_view") else 0,
-        com.get("avg_finish_quality"),
-        com.get("avg_condition"),
-        com.get("avg_appeal"),
-        summary.get("photos_total"),
-        summary.get("photos_scored"),
-        summary.get("photos_apartment"),
-        summary.get("photos_common"),
-        summary.get("photos_irrelevant"),
-        json.dumps(apt.get("room_type_counts") or {}),
-        json.dumps(com.get("space_type_counts") or {}),
-        _utcnow(),
-    )
+    row = {
+        "listing_id": listing_id,
+        "avg_natural_light": apt.get("avg_natural_light"),
+        "avg_finish_quality": apt.get("avg_finish_quality"),
+        "avg_space_feeling": apt.get("avg_space_feeling"),
+        "avg_condition": apt.get("avg_condition"),
+        "max_view_quality": apt.get("max_view_quality"),
+        "pct_bright_rooms": apt.get("pct_bright_rooms"),
+        "has_good_view": 1 if apt.get("has_good_view") else 0,
+        "common_avg_finish_quality": com.get("avg_finish_quality"),
+        "common_avg_condition": com.get("avg_condition"),
+        "common_avg_appeal": com.get("avg_appeal"),
+        "photos_total": summary.get("photos_total"),
+        "photos_scored": summary.get("photos_scored"),
+        "photos_apartment": summary.get("photos_apartment"),
+        "photos_common": summary.get("photos_common"),
+        "photos_irrelevant": summary.get("photos_irrelevant"),
+        "room_type_counts_json": json.dumps(apt.get("room_type_counts") or {}),
+        "space_type_counts_json": json.dumps(com.get("space_type_counts") or {}),
+        "aggregated_at": _utcnow(),
+    }
+    values = tuple(row[name] for name in (
+        "listing_id",
+        "avg_natural_light", "avg_finish_quality", "avg_space_feeling", "avg_condition",
+        "max_view_quality", "pct_bright_rooms", "has_good_view",
+        "common_avg_finish_quality", "common_avg_condition", "common_avg_appeal",
+        "photos_total", "photos_scored", "photos_apartment", "photos_common",
+        "photos_irrelevant",
+        "room_type_counts_json", "space_type_counts_json",
+        "aggregated_at",
+    ))
     conn.execute(
         """
         INSERT OR REPLACE INTO listing_scores (
@@ -583,6 +616,7 @@ def upsert_listing_scores(
         """,
         values,
     )
+    _mirror(lambda remote: remote.mirror_listing_scores(row))
 
 
 # ── DB-level summary (useful for CLI tools) ──────────────────────────────────
