@@ -603,16 +603,22 @@ def _columns_list() -> list[dict]:
 
 
 def _read_mappings() -> str:
-    return json.dumps([
-        {
+    rows = []
+    for column in _columns_list():
+        # One-hot training columns. The chat joins regression_results, not this table.
+        if column["table"] == "regression_features":
+            continue
+        row = {
             "table": column["table"],
             "name": column["name"],
             "type": column["type"],
             "description": column["description"],
             "is_enum": "enum_values" in column,
         }
-        for column in _columns_list()
-    ])
+        if "enum_values" in column:
+            row["enum_values"] = column["enum_values"]
+        rows.append(row)
+    return json.dumps(rows)
 
 
 def _split_column(column: str) -> tuple[str | None, str]:
@@ -697,9 +703,11 @@ def _run_sql(query: str) -> str:
 
 @function_tool
 def read_mappings() -> str:
-    """Read every rental table's columns: table, name, type, a description, and whether it's an enum.
+    """Read rental table columns: table, name, type, a description, and enum values for a small enum.
 
-    Call this first. Call get_enum_values for an enum column's valid values.
+    Call this only when no analysis tool can answer the question. Small enums such as
+    neighborhood and listing_status include their values here. Call get_enum_values only
+    when a column is an enum and this list left its values out.
     """
     return _read_mappings()
 
@@ -707,6 +715,8 @@ def read_mappings() -> str:
 @function_tool
 def get_enum_values(column: str) -> str:
     """Get the exact valid values of an enum column. Match them exactly: equality is case-sensitive.
+
+    Call this only when read_mappings did not include enum_values for the column.
 
     Args:
         column: A column name, e.g. 'neighborhood', or 'listings.neighborhood' when the name is shared.
@@ -787,6 +797,45 @@ def _resolve_neighborhood(name: str) -> str:
     raise ToolError(
         f"No neighborhood '{cleaned}'. Valid neighborhoods: {', '.join(neighborhoods)}."
     )
+
+
+# Umbrella names are not stored on listings.neighborhood. UES has no row of its own.
+_AREA_ALIASES = {
+    "ues": ("Carnegie Hill", "Lenox Hill", "Yorkville", "Sutton Place"),
+    "upper east side": ("Carnegie Hill", "Lenox Hill", "Yorkville", "Sutton Place"),
+    "uws": ("Upper West Side", "Lincoln Square", "Manhattan Valley", "Morningside Heights"),
+    "upper west side": ("Upper West Side", "Lincoln Square", "Manhattan Valley", "Morningside Heights"),
+}
+
+
+def _resolve_areas(neighborhoods) -> list[str]:
+    """Expand area aliases and neighborhood names into canonical neighborhood values."""
+    if neighborhoods is None or neighborhoods == "":
+        return []
+    known = {name.casefold(): name for name in _neighborhoods()}
+    resolved = []
+    for part in _split_names(neighborhoods):
+        key = part.casefold()
+        if key in _AREA_ALIASES:
+            matched = []
+            for alias_name in _AREA_ALIASES[key]:
+                canonical = known.get(alias_name.casefold())
+                if canonical and canonical not in resolved and canonical not in matched:
+                    matched.append(canonical)
+            if not matched:
+                raise ToolError(
+                    f"No neighborhood '{part}'. Valid neighborhoods: {', '.join(known.values())}."
+                )
+            resolved.extend(matched)
+            continue
+        canonical = known.get(key)
+        if canonical is None:
+            raise ToolError(
+                f"No neighborhood '{part}'. Valid neighborhoods: {', '.join(known.values())}."
+            )
+        if canonical not in resolved:
+            resolved.append(canonical)
+    return resolved
 
 
 def _optional_number(value, label: str) -> float | None:
@@ -988,14 +1037,32 @@ def get_building_amenities(building: str) -> dict:
 
 
 @_tool
-def get_deals(neighborhood: str | None = None, limit: int = 10) -> dict:
+def get_deals(
+    neighborhood: str | None = None,
+    min_beds: float | None = None,
+    max_beds: float | None = None,
+    max_rent: float | None = None,
+    limit: int = 10,
+) -> dict:
     """List model deals: predicted rent, actual rent, percent discount, and deal score.
 
+    Use this for a deal question with a neighborhood, an area, bedrooms, or a max rent.
+    Do not write SQL for that. 'UES' and 'Upper East Side' cover Carnegie Hill, Lenox Hill,
+    Yorkville, and Sutton Place. 'UWS' and 'Upper West Side' cover Upper West Side,
+    Lincoln Square, Manhattan Valley, and Morningside Heights. Several names can be
+    comma-separated, as in 'Chelsea, Hell's Kitchen'.
+
     Args:
-        neighborhood: Limit to one neighborhood. Optional.
+        neighborhood: Neighborhood, area alias, or comma-separated names. Optional.
+        min_beds: Minimum bedrooms. Optional.
+        max_beds: Maximum bedrooms. Optional.
+        max_rent: Maximum monthly rent. Optional.
         limit: How many deals to return, 1 to 25. Defaults to 10.
     """
     limit = _clamp_int(limit, 10, 1, 25)
+    min_beds = _optional_number(min_beds, "min_beds")
+    max_beds = _optional_number(max_beds, "max_beds")
+    max_rent = _optional_number(max_rent, "max_rent")
     scored = _query_rows("SELECT COUNT(*) AS n FROM regression_results")[0]["n"]
     if not scored:
         raise ToolError(
@@ -1003,17 +1070,26 @@ def get_deals(neighborhood: str | None = None, limit: int = 10) -> dict:
             "Run features.py to score listings before asking for deals."
         )
 
+    resolved = _resolve_areas(neighborhood)
     clauses = []
     params: list = []
-    resolved = None
-    if neighborhood:
-        resolved = _resolve_neighborhood(neighborhood)
-        clauses.append("l.neighborhood = ?")
-        params.append(resolved)
+    if resolved:
+        marks = ", ".join("?" for _ in resolved)
+        clauses.append(f"l.neighborhood IN ({marks})")
+        params.extend(resolved)
+    if min_beds is not None:
+        clauses.append("l.beds >= ?")
+        params.append(min_beds)
+    if max_beds is not None:
+        clauses.append("l.beds <= ?")
+        params.append(max_beds)
+    if max_rent is not None:
+        clauses.append("l.rent <= ?")
+        params.append(max_rent)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     rows = _listing_rows(
         f"""
-        SELECT l.listing_id, l.name AS building, l.unit, l.neighborhood,
+        SELECT l.listing_id, l.name AS building, l.street, l.unit, l.neighborhood,
                l.beds, l.baths, l.sqft, l.rent AS actual_rent,
                r.predicted_rent, r.percent_discount, r.deal_score
         FROM listings l
@@ -1024,8 +1100,14 @@ def get_deals(neighborhood: str | None = None, limit: int = 10) -> dict:
         """,
         tuple(params) + (limit,),
     )
+    filters = {
+        "min_beds": min_beds,
+        "max_beds": max_beds,
+        "max_rent": max_rent,
+    }
     return {
-        "neighborhood": resolved,
+        "neighborhoods": resolved or None,
+        "filters": {key: value for key, value in filters.items() if value is not None},
         "ranked_by": "deal_score",
         "count": len(rows),
         "listings": rows,
@@ -1054,10 +1136,10 @@ def cheapest_in_neighborhood(
 
 @_tool
 def best_deals_in_neighborhood(neighborhood: str, limit: int = 5) -> dict:
-    """Best model deals in one neighborhood, ranked by deal score.
+    """Best model deals in one neighborhood or area, ranked by deal score.
 
     Args:
-        neighborhood: Neighborhood name, such as 'Chelsea'.
+        neighborhood: Neighborhood or area name, such as 'Chelsea' or 'UES'.
         limit: How many deals to return, 1 to 25. Defaults to 5.
     """
     return get_deals.__wrapped__(neighborhood=neighborhood, limit=limit)

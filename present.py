@@ -205,13 +205,14 @@ def _cards(ids: list[str], saved: set[str] | None = None) -> list[dict]:
                    l.description, r.deal_score, i.image_url
             FROM listings l
             LEFT JOIN regression_results r ON r.listing_id = l.listing_id
+            LEFT JOIN (
+                SELECT listing_id, MIN(position) AS position
+                FROM listing_images
+                GROUP BY listing_id
+            ) first_image ON first_image.listing_id = l.listing_id
             LEFT JOIN listing_images i
-                ON i.listing_id = l.listing_id
-               AND i.position = (
-                    SELECT MIN(position)
-                    FROM listing_images
-                    WHERE listing_id = l.listing_id
-               )
+                ON i.listing_id = first_image.listing_id
+               AND i.position = first_image.position
             WHERE l.listing_id IN ({placeholders})
             """,
             ids,
