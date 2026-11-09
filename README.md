@@ -1,4 +1,4 @@
-# NYC Rental Analyst
+# NYC Rental Agent
 
 A chat agent over a local NYC rental apartment listing database. Ask about neighborhoods, rents, buildings, and model deals. The page streams each tool call, then shows the answer with listing cards you can save.
 
@@ -51,7 +51,7 @@ From the project root:
 uv run app.py
 ```
 
-Open http://localhost:8001. The port is `PORT`, default `8001`.
+Open [http://localhost:8001](http://localhost:8001). The port is `PORT`, default `8001`.
 
 The sidebar keeps past chats (`conversations.db`) and saved listings (`ui.db`). Both files are local and gitignored. With `APP_ENV=prod` those rows are in BigQuery instead, in `agent_sessions`, `agent_messages`, and `favorites`. Tool steps stream in as they run. When a turn returns listings, the page shows a card grid, one card, or a pair, depending on the question.
 
@@ -91,37 +91,43 @@ Photo scoring needs the same Vertex credentials as the chat. It sends local imag
 
 ## Layout
 
-| Path | Role |
-| --- | --- |
-| `app.py` | FastAPI chat server, agent, and SSE stream of tool calls |
-| `tools.py` | Read-only SQL tools and the analysis tools the agent calls |
-| `present.py` | Listing cards, chat history, and saved listings |
-| `index.html`, `static/` | Chat page |
-| `scripts/db.py` | SQLite schema and write helpers, mirrored to BigQuery |
-| `scripts/bq.py` | BigQuery dataset, loads, and merges |
-| `scripts/migrate_to_bigquery.py` | One-time load of the local SQLite files |
-| `session_store.py` | Chat history: SQLite locally, BigQuery in prod |
-| `scripts/scrape_listings.py` | StreetEasy search scrape and photo download |
-| `scripts/backfill_details.py` | Detail-page backfill |
-| `scripts/score_listings.py` | Gemini photo scoring |
-| `scripts/features.py` | Feature frame and deal-score regression |
-| `scripts/update_listings.py` | Refresh stale rent and status |
-| `scripts/rentals.db` | Listings, amenities, images, scores, deal results |
-| `scripts/images/` | Downloaded photos, used only by the local scorer |
+
+| Path                             | Role                                                       |
+| -------------------------------- | ---------------------------------------------------------- |
+| `app.py`                         | FastAPI chat server, agent, and SSE stream of tool calls   |
+| `tools.py`                       | Read-only SQL tools and the analysis tools the agent calls |
+| `present.py`                     | Listing cards, chat history, and saved listings            |
+| `index.html`, `static/`          | Chat page                                                  |
+| `scripts/db.py`                  | SQLite schema and write helpers, mirrored to BigQuery      |
+| `scripts/bq.py`                  | BigQuery dataset, loads, and merges                        |
+| `scripts/migrate_to_bigquery.py` | One-time load of the local SQLite files                    |
+| `session_store.py`               | Chat history: SQLite locally, BigQuery in prod             |
+| `scripts/scrape_listings.py`     | StreetEasy search scrape and photo download                |
+| `scripts/backfill_details.py`    | Detail-page backfill                                       |
+| `scripts/score_listings.py`      | Gemini photo scoring                                       |
+| `scripts/features.py`            | Feature frame and deal-score regression                    |
+| `scripts/update_listings.py`     | Refresh stale rent and status                              |
+| `scripts/rentals.db`             | Listings, amenities, images, scores, deal results          |
+| `scripts/images/`                | Downloaded photos, used only by the local scorer           |
+
+
+
 
 ## Database
 
 `listing_id` (building slug plus unit) joins the listing tables. `image_url` joins `listing_images` to `image_scores`; a shared building photo is scored once.
 
-| Table | Contents |
-| --- | --- |
-| `listings` | One row per StreetEasy listing |
-| `listing_amenities` | Normalized amenity tags |
-| `listing_images` | Photo URLs and local paths, in listing order |
-| `image_scores` | Gemini scores for one image |
-| `listing_scores` | Photo aggregates for one listing |
+
+| Table                 | Contents                                                                                                                                                                  |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `listings`            | One row per StreetEasy listing                                                                                                                                            |
+| `listing_amenities`   | Normalized amenity tags                                                                                                                                                   |
+| `listing_images`      | Photo URLs and local paths, in listing order                                                                                                                              |
+| `image_scores`        | Gemini scores for one image                                                                                                                                               |
+| `listing_scores`      | Photo aggregates for one listing                                                                                                                                          |
 | `regression_features` | Numeric frame the rent model trained on. In BigQuery, a column name keeps only letters, numbers, and underscores, so `nh_Hell's Kitchen` is stored as `nh_Hells_Kitchen`. |
-| `regression_results` | Predicted rent, percent discount, deal score |
+| `regression_results`  | Predicted rent, percent discount, deal score                                                                                                                              |
+
 
 `run_sql` allows a single `SELECT` or `WITH`. Writes, `PRAGMA`, and multiple statements are rejected before they run. Locally the connection is opened read-only. In prod the same guard runs against BigQuery Standard SQL. Results are capped at 100 rows.
 
