@@ -279,6 +279,8 @@ function photo(listing, link) {
         const img = document.createElement("img");
         img.src = listing.image;
         img.alt = "";
+        img.decoding = "async";
+        img.loading = "lazy";
         frame.append(img);
     }
     return frame;
@@ -469,7 +471,12 @@ function toolBlock(call) {
     const details = document.createElement("details");
     const summary = document.createElement("summary");
     summary.textContent = resultSummary(call);
-    details.append(summary, el("pre", "tool-result", pretty(call.result)));
+    details.append(summary);
+    // Tool payloads can be large. Format them only if the step is opened.
+    details.addEventListener("toggle", () => {
+        if (!details.open || details.querySelector(".tool-result")) return;
+        details.append(el("pre", "tool-result", pretty(call.result)));
+    });
     block.append(details);
     return block;
 }
@@ -651,15 +658,27 @@ function renderEmpty() {
     log.append(empty);
 }
 
+function showFromTop(node) {
+    const box = logScroll.getBoundingClientRect();
+    const rect = node.getBoundingClientRect();
+    logScroll.scrollTop += rect.top - box.top - 8;
+}
+
+function renderStatus(text) {
+    log.replaceChildren(el("p", "pending", text));
+}
+
 function renderThread(turns) {
     log.replaceChildren();
     if (!turns.length) {
         renderEmpty();
         return;
     }
-    turns.forEach((turn) => log.append(renderTurn(turn)));
+    const fragment = document.createDocumentFragment();
+    turns.forEach((turn) => fragment.append(renderTurn(turn)));
+    log.append(fragment);
     const last = log.querySelector(".turn:last-child");
-    if (last) last.scrollIntoView({ block: "start" });
+    if (last) showFromTop(last);
 }
 
 function renderTop() {
@@ -668,6 +687,7 @@ function renderTop() {
 }
 
 function renderRail() {
+    const scroll = railBody.scrollTop;
     railBody.replaceChildren();
     const head = el("div", "rail-head");
     if (state.tab === "chats") {
@@ -680,6 +700,7 @@ function renderRail() {
         railBody.append(head);
         if (!state.threads.length) {
             railBody.append(el("p", "rail-note", "No chats yet."));
+            railBody.scrollTop = scroll;
             return;
         }
         const list = el("div", "thread-list");
@@ -688,6 +709,7 @@ function renderRail() {
             const open = document.createElement("button");
             open.type = "button";
             open.className = "thread-open";
+            open.dataset.session = thread.session_id;
             open.textContent = thread.title;
             if (thread.session_id === state.sessionId) open.setAttribute("aria-current", "true");
             open.addEventListener("click", () => openThread(thread.session_id));
@@ -700,6 +722,7 @@ function renderRail() {
             list.append(row);
         });
         railBody.append(list);
+        railBody.scrollTop = scroll;
         return;
     }
     const select = document.createElement("select");
@@ -722,11 +745,13 @@ function renderRail() {
     railBody.append(head);
     if (!state.favorites.length) {
         railBody.append(el("p", "rail-note", "No saved listings yet. Save a unit from a reply to keep it here."));
+        railBody.scrollTop = scroll;
         return;
     }
     const list = el("div", "saved-list");
     state.favorites.forEach((listing) => list.append(savedRow(listing)));
     railBody.append(list);
+    railBody.scrollTop = scroll;
 }
 
 function syncHearts() {
@@ -747,9 +772,11 @@ function setTab(tab) {
 }
 
 function showChats() {
+    const changed = state.tab !== "chats";
     state.tab = "chats";
     tabChats.setAttribute("aria-selected", "true");
     tabSaved.setAttribute("aria-selected", "false");
+    if (changed) renderRail();
 }
 
 function closeRail() {
@@ -760,10 +787,26 @@ function closeRail() {
 function setBusy(busy) {
     state.sending = busy;
     sendBtn.disabled = busy;
-    input.disabled = busy;
+    sendBtn.textContent = busy ? "Sending" : "Send";
     document.querySelectorAll(".prompt").forEach((button) => {
         button.disabled = busy;
     });
+}
+
+function markCurrentThread() {
+    railBody.querySelectorAll(".thread-open").forEach((button) => {
+        if (button.dataset.session === state.sessionId) button.setAttribute("aria-current", "true");
+        else button.removeAttribute("aria-current");
+    });
+}
+
+function refreshThreads() {
+    loadThreads()
+        .then(() => {
+            renderTop();
+            if (state.tab === "chats") renderRail();
+        })
+        .catch(() => {});
 }
 
 async function loadThreads() {
@@ -791,36 +834,66 @@ function newChat() {
     input.focus();
 }
 
+function applyLoaded(data) {
+    state.sessionId = data.session_id;
+    state.title = data.title || "Chat";
+    sessionStorage.setItem(STORE, state.sessionId);
+    renderThread(data.turns || []);
+    renderTop();
+    markCurrentThread();
+}
+
 async function openThread(sessionId) {
+    if (sessionId === state.sessionId && log.querySelector(".turn")) {
+        closeRail();
+        return;
+    }
+    state.sessionId = sessionId;
+    sessionStorage.setItem(STORE, sessionId);
+    markCurrentThread();
+    renderTop();
+    renderStatus("Opening chat");
+    closeRail();
     const response = await fetch(`/threads/${encodeURIComponent(sessionId)}`);
+    if (state.sessionId !== sessionId) return;
     if (!response.ok) {
         sessionStorage.removeItem(STORE);
         newChat();
         return;
     }
     const data = await response.json();
-    state.sessionId = data.session_id;
-    state.title = data.title || "Chat";
-    sessionStorage.setItem(STORE, state.sessionId);
-    renderThread(data.turns || []);
-    renderTop();
-    renderRail();
-    closeRail();
+    if (state.sessionId !== sessionId) return;
+    applyLoaded(data);
 }
 
 async function deleteThread(sessionId) {
-    await fetch(`/clear?session_id=${encodeURIComponent(sessionId)}`, { method: "POST" });
+    const snapshot = state.threads.slice();
+    state.threads = state.threads.filter((thread) => thread.session_id !== sessionId);
     if (state.sessionId === sessionId) {
         state.sessionId = null;
         sessionStorage.removeItem(STORE);
         renderEmpty();
         renderTop();
     }
-    await loadThreads();
     renderRail();
+    const response = await fetch(`/clear?session_id=${encodeURIComponent(sessionId)}`, { method: "POST" });
+    if (!response.ok) {
+        state.threads = snapshot;
+        renderRail();
+    }
 }
 
 async function toggleFavorite(listingId, shouldSave) {
+    const snapshot = state.favorites.map((listing) => ({ ...listing }));
+    if (shouldSave) {
+        if (!state.favorites.some((listing) => listing.listing_id === listingId)) {
+            state.favorites = [{ listing_id: listingId }, ...state.favorites];
+        }
+    } else {
+        state.favorites = state.favorites.filter((listing) => listing.listing_id !== listingId);
+    }
+    syncHearts();
+    if (state.tab === "saved") renderRail();
     const response = shouldSave
         ? await fetch("/favorites", {
             method: "POST",
@@ -828,10 +901,31 @@ async function toggleFavorite(listingId, shouldSave) {
             body: JSON.stringify({ listing_id: listingId }),
         })
         : await fetch(`/favorites/${encodeURIComponent(listingId)}`, { method: "DELETE" });
-    if (!response.ok) return;
-    await loadFavorites();
+    if (!response.ok) {
+        state.favorites = snapshot;
+        syncHearts();
+        if (state.tab === "saved") renderRail();
+        return;
+    }
+    if (shouldSave) {
+        const card = await response.json().catch(() => null);
+        if (card && card.listing_id) {
+            state.favorites = [
+                card,
+                ...state.favorites.filter((listing) => listing.listing_id !== listingId),
+            ];
+        }
+    }
     syncHearts();
-    if (state.tab === "saved") renderRail();
+    if (shouldSave && state.tab === "saved") renderRail();
+    if (shouldSave && state.sort !== "recent") {
+        loadFavorites()
+            .then(() => {
+                syncHearts();
+                if (state.tab === "saved") renderRail();
+            })
+            .catch(() => {});
+    }
 }
 
 async function send(text) {
@@ -844,7 +938,8 @@ async function send(text) {
     if (!log.querySelector(".turn")) log.replaceChildren();
     const pending = renderTurn({ user: message, pending: true });
     log.append(pending);
-    pending.scrollIntoView({ block: "start" });
+    showFromTop(pending);
+    let keepFocus = true;
     try {
         const response = await fetch("/chat", {
             method: "POST",
@@ -871,6 +966,11 @@ async function send(text) {
             });
         }
         if (!finished) throw new Error("The reply ended before an answer arrived.");
+        if (!log.contains(pending)) {
+            keepFocus = false;
+            refreshThreads();
+            return;
+        }
         state.sessionId = finished.session_id;
         sessionStorage.setItem(STORE, state.sessionId);
         const done = renderTurn({
@@ -882,21 +982,22 @@ async function send(text) {
         });
         pending.replaceWith(done);
         const answer = done.querySelector(".answer, .feature, .cards") || done;
-        answer.scrollIntoView({ block: "start" });
-        await loadThreads();
-        renderTop();
-        renderRail();
+        showFromTop(answer);
+        refreshThreads();
     } catch (error) {
-        pending.replaceWith(renderTurn({
-            user: message,
-            response: `Something went wrong: ${error.message}`,
-            tool_calls: [],
-            display: "none",
-            listings: [],
-        }));
+        if (!log.contains(pending)) keepFocus = false;
+        else {
+            pending.replaceWith(renderTurn({
+                user: message,
+                response: `Something went wrong: ${error.message}`,
+                tool_calls: [],
+                display: "none",
+                listings: [],
+            }));
+        }
     } finally {
         setBusy(false);
-        input.focus();
+        if (keepFocus) input.focus();
     }
 }
 
@@ -929,16 +1030,30 @@ input.addEventListener("input", () => {
 });
 
 async function init() {
+    const stored = sessionStorage.getItem(STORE);
+    const pendingThread = stored
+        ? fetch(`/threads/${encodeURIComponent(stored)}`).then((response) => (
+            response.ok ? response.json() : null
+        )).catch(() => null)
+        : null;
+    renderStatus("Loading");
     try {
         await Promise.all([loadThreads(), loadFavorites()]);
     } catch {
         state.threads = [];
         state.favorites = [];
     }
-    const stored = sessionStorage.getItem(STORE);
-    if (stored && state.threads.some((thread) => thread.session_id === stored)) {
-        await openThread(stored);
-        return;
+    renderRail();
+    if (pendingThread && state.threads.some((thread) => thread.session_id === stored)) {
+        state.sessionId = stored;
+        markCurrentThread();
+        renderTop();
+        const data = await pendingThread;
+        if (state.sessionId !== stored) return;
+        if (data && data.session_id === stored) {
+            applyLoaded(data);
+            return;
+        }
     }
     newChat();
 }

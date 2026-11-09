@@ -62,6 +62,7 @@ _EXPENSIVE = re.compile(r"\b(most expensive|highest rent|priciest)\b", re.IGNORE
 _DEAL = re.compile(r"\b(best deal|top deal|deal score)\b", re.IGNORECASE)
 
 _ui_lock = threading.Lock()
+_tls = threading.local()
 
 
 def init_ui() -> None:
@@ -84,10 +85,29 @@ def init_ui() -> None:
 
 
 def _rentals():
+    """Read-only connection reused on this thread.
+
+    Opening SQLite for every card was most of the wait when a chat or the
+    saved list rendered. The connection stays read-only.
+    """
+    conn = getattr(_tls, "rentals", None)
+    if conn is not None:
+        return conn
     uri = RENTALS_DB.resolve().as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    _tls.rentals = conn
     return conn
+
+
+def _drop_rentals(conn) -> None:
+    if getattr(_tls, "rentals", None) is conn:
+        _tls.rentals = None
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
 
 
 def _ui():
@@ -120,8 +140,15 @@ def _rows(connect, sql: str, params: tuple | list = ()) -> list[dict]:
     conn = connect()
     try:
         return [dict(row) for row in conn.execute(sql, params)]
+    except sqlite3.Error:
+        if connect is not _rentals:
+            raise
+        # A replaced rentals.db leaves this thread holding the old file.
+        _drop_rentals(conn)
+        return [dict(row) for row in _rentals().execute(sql, params)]
     finally:
-        conn.close()
+        if connect is not _rentals:
+            conn.close()
 
 
 def favorite_ids() -> set[str]:
@@ -178,17 +205,13 @@ def _cards(ids: list[str], saved: set[str] | None = None) -> list[dict]:
                    l.description, r.deal_score, i.image_url
             FROM listings l
             LEFT JOIN regression_results r ON r.listing_id = l.listing_id
-            LEFT JOIN (
-                SELECT listing_id, image_url
-                FROM (
-                    SELECT listing_id, image_url,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY listing_id ORDER BY position
-                           ) AS rn
+            LEFT JOIN listing_images i
+                ON i.listing_id = l.listing_id
+               AND i.position = (
+                    SELECT MIN(position)
                     FROM listing_images
-                ) ranked
-                WHERE rn = 1
-            ) i ON i.listing_id = l.listing_id
+                    WHERE listing_id = l.listing_id
+               )
             WHERE l.listing_id IN ({placeholders})
             """,
             ids,
@@ -381,7 +404,7 @@ def _metrics(ids: list[str]) -> dict[str, dict]:
     return {row["listing_id"]: row for row in rows}
 
 
-def _choose_single(question: str, groups: list[list[str]]) -> str:
+def _choose_single(question: str, groups: list[list[str]], metrics: dict[str, dict] | None = None) -> str:
     for group in reversed(groups):
         if len(group) == 1:
             return group[0]
@@ -393,7 +416,8 @@ def _choose_single(question: str, groups: list[list[str]]) -> str:
             if listing_id not in seen:
                 seen.add(listing_id)
                 ordered.append(listing_id)
-    metrics = _metrics(ordered)
+    if metrics is None:
+        metrics = _metrics(ordered)
     unit_match = _UNIT.search(question or "")
     if unit_match:
         token = unit_match.group(1).casefold()
@@ -462,14 +486,19 @@ def resolve_display(question: str, tool_calls: list[dict], answer: str | None = 
                 if listing_id not in seen:
                     seen.add(listing_id)
                     unique.append(listing_id)
-        named = _mentioned(answer or "", _cards(unique))
+        by_id = {card["listing_id"]: card for card in _cards(unique)}
+        named = _mentioned(answer or "", [by_id[listing_id] for listing_id in unique if listing_id in by_id])
         # A singular question can still be answered with several apartments.
         # Show a card for each one the reply names.
         if len(named) >= 2:
             return {"display": "paired", "listings": named}
         single = mode == "single" or (mode == "auto" and len(unique) == 1)
         if single:
-            cards = named or _cards([_choose_single(question, groups)])
+            if named:
+                cards = named[:1]
+            else:
+                pick = _choose_single(question, groups, by_id)
+                cards = [by_id[pick]] if pick in by_id else []
             if not cards:
                 return {"display": "none", "listings": []}
             return {"display": "single", "listings": cards[:1]}
@@ -478,7 +507,7 @@ def resolve_display(question: str, tool_calls: list[dict], answer: str | None = 
         for group in groups:
             if len(group) == len(largest):
                 largest = group
-        cards = _cards(largest)
+        cards = [by_id[listing_id] for listing_id in largest if listing_id in by_id]
         if not cards:
             return {"display": "none", "listings": []}
         return {"display": "grid", "listings": cards}
@@ -583,6 +612,42 @@ def _title_from(text: str) -> str:
     return text
 
 
+def _user_title(blob: str | None) -> str | None:
+    if not blob:
+        return None
+    try:
+        item = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(item, dict) and item.get("role") == "user":
+        return _title_from(_text_content(item.get("content")))
+    return None
+
+
+def _title_from_messages(session_id: str, first_blob: str | None) -> str:
+    """Title from the first user message, without reading later tool payloads."""
+    title = _user_title(first_blob)
+    if title:
+        return title
+    # The first stored row is the question. Scan this session only when it is not.
+    if not first_blob:
+        return "Chat"
+    try:
+        json.loads(first_blob)
+    except (json.JSONDecodeError, TypeError):
+        return "Chat"
+    rows = _rows(
+        _sessions,
+        "SELECT message_data FROM agent_messages WHERE session_id = ? ORDER BY id",
+        (session_id,),
+    )
+    for row in rows:
+        title = _user_title(row["message_data"])
+        if title:
+            return title
+    return "Chat"
+
+
 def list_threads() -> list[dict]:
     if not _sessions_ready():
         return []
@@ -591,36 +656,21 @@ def list_threads() -> list[dict]:
         """
         SELECT s.session_id, s.updated_at, m.message_data
         FROM agent_sessions s
-        JOIN agent_messages m ON m.session_id = s.session_id
-        ORDER BY s.updated_at DESC, m.id ASC
+        JOIN agent_messages m ON m.id = (
+            SELECT MIN(id) FROM agent_messages
+            WHERE session_id = s.session_id
+        )
+        ORDER BY s.updated_at DESC
         """,
     )
-    threads = []
-    seen = set()
-    titles: dict[str, str] = {}
-    updated: dict[str, str] = {}
-    order = []
-    for row in rows:
-        session_id = row["session_id"]
-        if session_id not in seen:
-            seen.add(session_id)
-            order.append(session_id)
-            updated[session_id] = row["updated_at"]
-        if session_id in titles:
-            continue
-        try:
-            item = json.loads(row["message_data"])
-        except json.JSONDecodeError:
-            continue
-        if item.get("role") == "user":
-            titles[session_id] = _title_from(_text_content(item.get("content")))
-    for session_id in order:
-        threads.append({
-            "session_id": session_id,
-            "title": titles.get(session_id, "Chat"),
-            "updated_at": updated.get(session_id),
-        })
-    return threads
+    return [
+        {
+            "session_id": row["session_id"],
+            "title": _title_from_messages(row["session_id"], row["message_data"]),
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]
 
 
 def load_thread(session_id: str) -> dict | None:

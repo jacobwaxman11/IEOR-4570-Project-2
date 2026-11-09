@@ -119,7 +119,7 @@ if bq.prod():
     )
 
 agent = Agent(
-    name="NYC Rental Analyst",
+    name="NYC Rental Agent",
     instructions=_INSTRUCTIONS,
     model=LitellmModel(model="vertex_ai/gemini-3.8-flash", api_key="unused"),
     model_settings=ModelSettings(extra_args={"vertex_location": "global"}),
@@ -235,7 +235,11 @@ async def chat(request: ChatRequest):
             # Keep the calls that already finished so the page can still show those steps.
             response = f"Model call failed: {type(e).__name__}: {str(e)[:300]}"
             tool_calls = hooks.tool_calls
-        presented = resolve_display(request.message, tool_calls, response)
+        # Card lookup hits SQLite or BigQuery. Keep it off the event loop so the
+        # page can keep painting tool steps and the sidebar stays clickable.
+        presented = await asyncio.to_thread(
+            resolve_display, request.message, tool_calls, response
+        )
         await hooks.events.put({
             "type": "done",
             "response": response,
