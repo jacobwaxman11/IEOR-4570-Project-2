@@ -175,16 +175,20 @@ def _cards(ids: list[str], saved: set[str] | None = None) -> list[dict]:
             f"""
             SELECT l.listing_id, l.name AS building, l.unit, l.neighborhood,
                    l.beds, l.baths, l.sqft, l.rent, l.url, l.listing_status,
-                   l.description, r.deal_score,
-                   (
-                       SELECT i.image_url
-                       FROM listing_images i
-                       WHERE i.listing_id = l.listing_id
-                       ORDER BY i.position
-                       LIMIT 1
-                   ) AS image_url
+                   l.description, r.deal_score, i.image_url
             FROM listings l
             LEFT JOIN regression_results r ON r.listing_id = l.listing_id
+            LEFT JOIN (
+                SELECT listing_id, image_url
+                FROM (
+                    SELECT listing_id, image_url,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY listing_id ORDER BY position
+                           ) AS rn
+                    FROM listing_images
+                ) ranked
+                WHERE rn = 1
+            ) i ON i.listing_id = l.listing_id
             WHERE l.listing_id IN ({placeholders})
             """,
             ids,
