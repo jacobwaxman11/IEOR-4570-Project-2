@@ -652,15 +652,20 @@ def _title_from_messages(session_id: str, first_blob: str | None) -> str:
 def list_threads() -> list[dict]:
     if not _sessions_ready():
         return []
+    # The first message is joined through a grouped id, not a subquery in ON.
+    # BigQuery rejects that subquery ("Unsupported subquery with table in join
+    # predicate"), so /threads 500s in prod and the sidebar stays empty.
     rows = _rows(
         _sessions,
         """
         SELECT s.session_id, s.updated_at, m.message_data
         FROM agent_sessions s
-        JOIN agent_messages m ON m.id = (
-            SELECT MIN(id) FROM agent_messages
-            WHERE session_id = s.session_id
-        )
+        JOIN agent_messages m ON m.session_id = s.session_id
+        JOIN (
+            SELECT session_id, MIN(id) AS id
+            FROM agent_messages
+            GROUP BY session_id
+        ) first_msg ON first_msg.session_id = m.session_id AND first_msg.id = m.id
         ORDER BY s.updated_at DESC
         """,
     )
