@@ -55,16 +55,13 @@ Which tool to use:
 - Filtered search by neighborhood, beds, baths, sqft, or rent: search_listings.
 - Cheapest units in a neighborhood: cheapest_in_neighborhood.
 - Amenities for a building: get_building_amenities.
-- Model deals, including beds, a max rent, or an area such as UES or UWS: get_deals. Best deals in one neighborhood: best_deals_in_neighborhood.
+- Model deals: get_deals. Best deals in one neighborhood: best_deals_in_neighborhood.
 - Compare rents across neighborhoods: compare_neighborhoods.
 - A short profile of one neighborhood: summarize_neighborhood.
-- Anything those tools cannot express: read_mappings, then one SELECT.
+- Anything else: read_mappings, then get_enum_values before filtering an enum, then run_sql.
 
-- Prefer an analysis tool over SQL. Do not call read_mappings when an analysis tool fits.
-- A filtered deal question is get_deals, not SQL. 'UES' and 'Upper East Side' are Carnegie Hill, Lenox Hill, Yorkville, and Sutton Place. 'UWS' and 'Upper West Side' are Upper West Side, Lincoln Square, Manhattan Valley, and Morningside Heights.
-- When writing SQL, call read_mappings first. It includes enum values for small enums. Call get_enum_values only when a value you need is not in that list. Never guess values.
-- After a tool result answers the question, write the answer. Do not run a second ranking, and do not open one listing or its amenities unless the user asked.
-- Never SELECT *. Name the columns you need.
+- When writing SQL, call read_mappings first.
+- Before filtering on an enum column in SQL, call get_enum_values. Never guess values.
 - Missing values are NULL. Exclude them from filters, groups, and aggregates. A missing sqft should not hide a listing from a size filter.
 - Quote an apostrophe in a SQL string as two apostrophes, as in 'Hell''s Kitchen'.
 - Answer in plain English. Don't show the SQL unless asked.
@@ -90,8 +87,7 @@ WHERE l.name = 'The Building' OR l.building_slug = 'the-building'
 GROUP BY a.amenity
 ORDER BY units DESC, a.amenity;
 
--- Model deals, only when get_deals cannot express the filter.
--- percent_discount is 100 * (predicted - actual) / predicted.
+-- Model deals. percent_discount is 100 * (predicted - actual) / predicted.
 SELECT l.listing_id, l.name, l.neighborhood, l.beds, l.rent,
        r.predicted_rent, r.percent_discount, r.deal_score
 FROM listings l
@@ -231,7 +227,7 @@ async def chat(request: ChatRequest):
                 request.message,
                 session=session,
                 hooks=hooks,
-                max_turns=8,
+                max_turns=25,
             )
             response, tool_calls = result.final_output, hooks.tool_calls
         except Exception as e:
