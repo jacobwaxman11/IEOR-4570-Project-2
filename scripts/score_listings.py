@@ -467,19 +467,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--sleep",
         type=float,
-        default=4,
+        default=3,
         help="Seconds to sleep between Gemini batch calls",
     )
     p.add_argument(
         "--batch-size",
         type=int,
-        default=5,
+        default=3,
         help="Number of images to send per Gemini API call",
     )
     p.add_argument(
         "--max-images",
         type=int,
-        default=20,
+        default=15,
         help="Cap images scored per listing (takes the first N)",
     )
     p.add_argument(

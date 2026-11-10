@@ -209,25 +209,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--stale-days",
         type=int,
-        default=STALE_DAYS,
+        default=7,
         help="Refresh listings whose last_updated_date is older than this many days",
     )
     p.add_argument(
         "--max-listings-checked",
         type=int,
-        default=None,
+        default=100,
         help="Cap how many stale listings to request from StreetEasy this run",
     )
     p.add_argument(
         "--min-delay",
         type=float,
-        default=5.0,
+        default=1.0,
         help="Min sleep before each detail-page request (seconds)",
     )
     p.add_argument(
         "--max-delay",
         type=float,
-        default=12.0,
+        default=3.0,
         help="Max sleep before each detail-page request (seconds)",
     )
     p.add_argument("--timeout", type=int, default=20, help="Per-request timeout in seconds")

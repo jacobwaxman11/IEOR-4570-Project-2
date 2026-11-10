@@ -452,7 +452,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--db", type=str, default=dbm.DEFAULT_DB_PATH, help="SQLite database path")
     p.add_argument("--price-min", type=int, default=3000, help="Minimum rent ($/mo)")
-    p.add_argument("--price-max", type=int, default=7000, help="Maximum rent ($/mo)")
+    p.add_argument("--price-max", type=int, default=8000, help="Maximum rent ($/mo)")
     p.add_argument(
         "--areas",
         type=str,
@@ -475,18 +475,18 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--image-dir", type=str, default="images", help="Directory for downloaded images")
     p.add_argument("--skip-images", action="store_true", help="Skip image downloads")
-    p.add_argument("--min-delay", type=float, default=2.0, help="Min delay between StreetEasy search pages (s)")
-    p.add_argument("--max-delay", type=float, default=4.0, help="Max delay between StreetEasy search pages (s)")
+    p.add_argument("--min-delay", type=float, default=1.0, help="Min delay between StreetEasy search pages (s)")
+    p.add_argument("--max-delay", type=float, default=3.0, help="Max delay between StreetEasy search pages (s)")
     p.add_argument(
         "--image-min-delay",
         type=float,
-        default=0.2,
+        default=0.1,
         help="Min delay between photo CDN downloads (s)",
     )
     p.add_argument(
         "--image-max-delay",
         type=float,
-        default=0.5,
+        default=0.3,
         help="Max delay between photo CDN downloads (s)",
     )
     return p.parse_args()

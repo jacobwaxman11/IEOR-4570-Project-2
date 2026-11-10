@@ -12,7 +12,7 @@ Design notes:
   - We use `curl_cffi` (mimics Chrome's TLS fingerprint). Do not pass a custom
     User-Agent: on curl_cffi 0.17 that replaces the impersonation headers, and
     PerimeterX 403s the mismatched fingerprint. The library's own headers work.
-  - Default delays are intentionally generous (5–12s) to avoid bans.
+  - Default delays are intentionally generous (4–8s) to avoid bans.
   - On the first 403 we **terminate immediately** — that signals the IP has
     been flagged, and continuing risks a longer block. Re-run later.
   - Saves are incremental (one commit per listing), so a Ctrl-C or 403 mid-run
@@ -296,13 +296,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--min-delay",
         type=float,
-        default=5.0,
+        default=4.0,
         help="Min sleep before each detail fetch (seconds)",
     )
     p.add_argument(
         "--max-delay",
         type=float,
-        default=12.0,
+        default=8.0,
         help="Max sleep before each detail fetch (seconds)",
     )
     p.add_argument(
