@@ -37,6 +37,14 @@ Tables written to ``--db``:
     regression_results   — actual_rent, predicted_rent, percent_discount,
                            deal_score (0–10)
 
+Only listings with ``listing_status = 'ACTIVE'`` are loaded. Inactive
+listings are left out of the feature frame, the ridge fit, and the deal
+scores. ``save_regression`` replaces both tables on every run. A listing
+that was scored while active keeps its ``regression_results`` row after it
+moves to another status, until the next run. That run omits it, and the
+replace deletes the old score. Changing ``listing_status`` does not update
+``regression_results`` by itself.
+
 ``percent_discount`` is ``100 * (predicted - actual) / predicted``. Positive
 means the unit is listed below the model. ``deal_score`` maps that onto
 0–10 with 5 = fairly priced: each 5 percentage points of discount moves the
@@ -117,8 +125,9 @@ AMENITY_TIER_C = frozenset({
 
 
 def _load_listings(conn: sqlite3.Connection) -> pd.DataFrame:
-    """Listing-level columns + listing_scores fields. Image-score columns are
-    NaN for listings the scorer hasn't reached yet.
+    """Active listings plus listing_scores fields. Image-score columns are
+    NaN for listings the scorer hasn't reached yet. Inactive listings are
+    excluded from training and from deal scores.
     """
     return pd.read_sql(
         """
@@ -138,6 +147,7 @@ def _load_listings(conn: sqlite3.Connection) -> pd.DataFrame:
             ls.common_avg_appeal
         FROM listings l
         LEFT JOIN listing_scores ls ON l.listing_id = ls.listing_id
+        WHERE l.listing_status = 'ACTIVE'
         """,
         conn,
     )
@@ -148,11 +158,17 @@ def _load_amenities_one_hot(
 ) -> pd.DataFrame:
     """Pivot listing_amenities into a one-hot matrix (one column per amenity).
 
-    Amenities present in fewer than ``min_count`` listings are dropped to
-    avoid fitting noise on the long tail of rare tags.
+    Amenities present in fewer than ``min_count`` active listings are dropped
+    to avoid fitting noise on the long tail of rare tags. Tags that appear
+    only on inactive listings are ignored.
     """
     raw = pd.read_sql(
-        "SELECT listing_id, amenity FROM listing_amenities",
+        """
+        SELECT a.listing_id, a.amenity
+        FROM listing_amenities a
+        JOIN listings l ON l.listing_id = a.listing_id
+        WHERE l.listing_status = 'ACTIVE'
+        """,
         conn,
     )
     if raw.empty:
@@ -445,7 +461,10 @@ def predict_deals(df: pd.DataFrame, rents: pd.Series) -> pd.DataFrame:
 
 
 def _load_rents(conn: sqlite3.Connection) -> pd.Series:
-    rents = pd.read_sql("SELECT listing_id, rent FROM listings", conn)
+    rents = pd.read_sql(
+        "SELECT listing_id, rent FROM listings WHERE listing_status = 'ACTIVE'",
+        conn,
+    )
     return rents.set_index("listing_id")["rent"]
 
 
@@ -454,7 +473,13 @@ def save_regression(
     features: pd.DataFrame,
     results: pd.DataFrame,
 ) -> None:
-    """Replace ``regression_features`` and ``regression_results`` with this run."""
+    """Replace ``regression_features`` and ``regression_results`` with this run.
+
+    Both tables are rewritten from the active listings in this fit. A listing
+    that left ACTIVE since the previous run is absent from ``results``, so the
+    delete drops its deal score. Status changes between runs leave the old
+    row in place until this replace.
+    """
     features.to_sql("regression_features", conn, if_exists="replace", index=False)
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_regression_features_listing "
@@ -482,8 +507,9 @@ def run_regression(
     raw: bool = False,
     verbose: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Build the feature frame, score deals, and write both tables.
+    """Build the feature frame from active listings, score those deals, and write both tables.
 
+    Inactive listings are not predictors and do not receive a deal score.
     Returns ``(features, results)``.
     """
     features = prepare_features(

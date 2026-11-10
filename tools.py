@@ -376,7 +376,10 @@ _DESCRIPTIONS: dict[tuple[str, str], str] = {
     ("regression_results", "model"): "Regression model name that produced the score.",
     ("image_scores", "scored_at"): "When the image was scored.",
     ("regression_results", "scored_at"): "When the deal score was written.",
-    ("listings", "listing_status"): "StreetEasy status, such as ACTIVE, RENTED, IN_CONTRACT, or DELISTED.",
+    ("listings", "listing_status"): (
+        "StreetEasy status, such as ACTIVE, RENTED, IN_CONTRACT, DELISTED, or OFF_MARKET. "
+        "Listing results default to listing_status = 'ACTIVE' unless another status was requested."
+    ),
     ("listings", "last_updated_date"): "As-of date of the rent and status currently stored.",
     ("regression_results", "actual_rent"): "Listed monthly rent in dollars.",
     ("regression_results", "predicted_rent"): "Model fair rent in dollars.",
@@ -740,6 +743,9 @@ def read_only_sql(data) -> ToolGuardrailFunctionOutput:
 def run_sql(query: str) -> str:
     """Run one read-only query against the rental database and return the rows.
 
+    Queries that return or aggregate listings must filter listing_status = 'ACTIVE'
+    unless the user asked for another status.
+
     Args:
         query: A single SELECT or WITH query.
     """
@@ -898,7 +904,7 @@ def search_listings(
     max_rent: float | None = None,
     limit: int = 10,
 ) -> dict:
-    """Find listings by neighborhood, bedrooms, bathrooms, square feet, and rent.
+    """Find active listings by neighborhood, bedrooms, bathrooms, square feet, and rent.
 
     Args:
         neighborhood: Neighborhood name, such as 'Chelsea' or 'Hell's Kitchen'. Optional.
@@ -920,7 +926,7 @@ def search_listings(
     min_rent = _optional_number(min_rent, "min_rent")
     max_rent = _optional_number(max_rent, "max_rent")
 
-    clauses = ["(listing_status IS NULL OR listing_status = 'ACTIVE')"]
+    clauses = ["listing_status = 'ACTIVE'"]
     params: list = []
     resolved = None
     if neighborhood:
@@ -979,7 +985,7 @@ def search_listings(
 
 @_tool
 def get_building_amenities(building: str) -> dict:
-    """List the amenities of one building, and how many of its units have each.
+    """List the amenities of one building, and how many of its active units have each.
 
     Args:
         building: Building name or StreetEasy building slug.
@@ -993,7 +999,7 @@ def get_building_amenities(building: str) -> dict:
             f"""
             SELECT building_slug, MIN(name) AS name, COUNT(*) AS units
             FROM listings
-            WHERE {where}
+            WHERE listing_status = 'ACTIVE' AND ({where})
             GROUP BY building_slug
             ORDER BY units DESC, name
             """,
@@ -1022,7 +1028,7 @@ def get_building_amenities(building: str) -> dict:
         SELECT a.amenity, COUNT(DISTINCT l.listing_id) AS units
         FROM listings l
         JOIN listing_amenities a ON l.listing_id = a.listing_id
-        WHERE l.building_slug = ?
+        WHERE l.building_slug = ? AND l.listing_status = 'ACTIVE'
         GROUP BY a.amenity
         ORDER BY units DESC, a.amenity
         """,
@@ -1044,7 +1050,7 @@ def get_deals(
     max_rent: float | None = None,
     limit: int = 10,
 ) -> dict:
-    """List model deals: predicted rent, actual rent, percent discount, and deal score.
+    """List model deals for active listings: predicted rent, actual rent, percent discount, and deal score.
 
     Use this for a deal question with a neighborhood, an area, bedrooms, or a max rent.
     Do not write SQL for that. 'UES' and 'Upper East Side' cover Carnegie Hill, Lenox Hill,
@@ -1063,15 +1069,22 @@ def get_deals(
     min_beds = _optional_number(min_beds, "min_beds")
     max_beds = _optional_number(max_beds, "max_beds")
     max_rent = _optional_number(max_rent, "max_rent")
-    scored = _query_rows("SELECT COUNT(*) AS n FROM regression_results")[0]["n"]
+    scored = _query_rows(
+        """
+        SELECT COUNT(*) AS n
+        FROM regression_results r
+        JOIN listings l ON l.listing_id = r.listing_id
+        WHERE l.listing_status = 'ACTIVE'
+        """
+    )[0]["n"]
     if not scored:
         raise ToolError(
-            "Deal scores have not been written yet. regression_results is empty. "
+            "Deal scores have not been written yet for active listings. "
             "Run features.py to score listings before asking for deals."
         )
 
     resolved = _resolve_areas(neighborhood)
-    clauses = []
+    clauses = ["l.listing_status = 'ACTIVE'"]
     params: list = []
     if resolved:
         marks = ", ".join("?" for _ in resolved)
@@ -1118,7 +1131,7 @@ def get_deals(
 def cheapest_in_neighborhood(
     neighborhood: str, min_beds: float | None = None, limit: int = 5
 ) -> dict:
-    """Cheapest listings in one neighborhood, ranked by listed rent.
+    """Cheapest active listings in one neighborhood, ranked by listed rent.
 
     Args:
         neighborhood: Neighborhood name, such as 'Chelsea'.
@@ -1136,7 +1149,7 @@ def cheapest_in_neighborhood(
 
 @_tool
 def best_deals_in_neighborhood(neighborhood: str, limit: int = 5) -> dict:
-    """Best model deals in one neighborhood or area, ranked by deal score.
+    """Best model deals among active listings in one neighborhood or area, ranked by deal score.
 
     Args:
         neighborhood: Neighborhood or area name, such as 'Chelsea' or 'UES'.
@@ -1147,7 +1160,7 @@ def best_deals_in_neighborhood(neighborhood: str, limit: int = 5) -> dict:
 
 @_tool
 def compare_neighborhoods(neighborhoods: str) -> dict:
-    """Compare listing counts and rents for two or more neighborhoods.
+    """Compare active listing counts and rents for two or more neighborhoods.
 
     Args:
         neighborhoods: Comma-separated names, such as 'Chelsea, Hell's Kitchen'.
@@ -1163,7 +1176,7 @@ def compare_neighborhoods(neighborhoods: str) -> dict:
     summaries = []
     for name in names:
         rows = _query_rows(
-            "SELECT rent, sqft FROM listings WHERE neighborhood = ?",
+            "SELECT rent, sqft FROM listings WHERE neighborhood = ? AND listing_status = 'ACTIVE'",
             (name,),
         )
         summaries.append({"neighborhood": name, **_price_stats(rows)})
@@ -1175,14 +1188,14 @@ def compare_neighborhoods(neighborhoods: str) -> dict:
 
 @_tool
 def summarize_neighborhood(neighborhood: str) -> dict:
-    """Price, bedroom mix, and most common amenities for one neighborhood.
+    """Price, bedroom mix, and most common amenities for active listings in one neighborhood.
 
     Args:
         neighborhood: Neighborhood name, such as 'Chelsea'.
     """
     name = _resolve_neighborhood(neighborhood)
     rows = _query_rows(
-        "SELECT rent, sqft, beds FROM listings WHERE neighborhood = ?",
+        "SELECT rent, sqft, beds FROM listings WHERE neighborhood = ? AND listing_status = 'ACTIVE'",
         (name,),
     )
     bed_counts: dict = {}
@@ -1197,7 +1210,7 @@ def summarize_neighborhood(neighborhood: str) -> dict:
         SELECT a.amenity, COUNT(DISTINCT l.listing_id) AS units
         FROM listings l
         JOIN listing_amenities a ON l.listing_id = a.listing_id
-        WHERE l.neighborhood = ?
+        WHERE l.neighborhood = ? AND l.listing_status = 'ACTIVE'
         GROUP BY a.amenity
         ORDER BY units DESC, a.amenity
         LIMIT 8

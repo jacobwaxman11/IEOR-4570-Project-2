@@ -49,7 +49,7 @@ Tables:
 - listing_images: photo references. Join to listings on listing_id.
 - image_scores: per-image scores. Join to listing_images on image_url.
 - listing_scores: aggregated photo scores. Join to listings on listing_id.
-- regression_results: predicted rent, actual rent, percent discount, and deal score. Join to listings on listing_id.
+- regression_results: predicted rent, actual rent, percent discount, and deal score for active listings. Join to listings on listing_id.
 
 Which tool to use:
 - Filtered search by neighborhood, beds, baths, sqft, or rent: search_listings.
@@ -63,6 +63,7 @@ Which tool to use:
 - When writing SQL, call read_mappings first.
 - Before filtering on an enum column in SQL, call get_enum_values. Never guess values.
 - Missing values are NULL. Exclude them from filters, groups, and aggregates. A missing sqft should not hide a listing from a size filter.
+- Return active listings unless the user asks about another status. Add `listing_status = 'ACTIVE'` to every query that returns or aggregates listings. Drop that filter only when the user asks about rented, delisted, in-contract, off-market, or another status.
 - Quote an apostrophe in a SQL string as two apostrophes, as in 'Hell''s Kitchen'.
 - Answer in plain English. Don't show the SQL unless asked.
 
@@ -71,7 +72,8 @@ Example queries:
 -- Filtered search. A missing sqft does not hide the listing.
 SELECT listing_id, name, unit, neighborhood, beds, baths, sqft, rent
 FROM listings
-WHERE neighborhood = 'Chelsea'
+WHERE listing_status = 'ACTIVE'
+  AND neighborhood = 'Chelsea'
   AND beds >= 1
   AND baths >= 1
   AND (sqft IS NULL OR sqft >= 500)
@@ -79,11 +81,12 @@ WHERE neighborhood = 'Chelsea'
 ORDER BY rent
 LIMIT 20;
 
--- Amenities for one building
+-- Amenities for one building, counted on active listings
 SELECT a.amenity, COUNT(DISTINCT l.listing_id) AS units
 FROM listings l
 JOIN listing_amenities a ON l.listing_id = a.listing_id
-WHERE l.name = 'The Building' OR l.building_slug = 'the-building'
+WHERE l.listing_status = 'ACTIVE'
+  AND (l.name = 'The Building' OR l.building_slug = 'the-building')
 GROUP BY a.amenity
 ORDER BY units DESC, a.amenity;
 
@@ -92,7 +95,8 @@ SELECT l.listing_id, l.name, l.neighborhood, l.beds, l.rent,
        r.predicted_rent, r.percent_discount, r.deal_score
 FROM listings l
 JOIN regression_results r ON l.listing_id = r.listing_id
-WHERE l.neighborhood = 'Hell''s Kitchen'
+WHERE l.listing_status = 'ACTIVE'
+  AND l.neighborhood = 'Hell''s Kitchen'
 ORDER BY r.deal_score DESC, r.percent_discount DESC
 LIMIT 10;
 
@@ -104,7 +108,8 @@ SELECT neighborhood,
        MAX(rent) AS max_rent,
        ROUND(AVG(CASE WHEN sqft > 0 THEN 1.0 * rent / sqft END), 2) AS avg_rent_per_sqft
 FROM listings
-WHERE neighborhood IN ('Chelsea', 'Hell''s Kitchen')
+WHERE listing_status = 'ACTIVE'
+  AND neighborhood IN ('Chelsea', 'Hell''s Kitchen')
   AND rent IS NOT NULL
 GROUP BY neighborhood
 ORDER BY avg_rent;
