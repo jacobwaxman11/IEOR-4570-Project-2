@@ -13,7 +13,7 @@ from agents import (
     set_tracing_disabled,
 )
 from agents.extensions.models.litellm_model import LitellmModel
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -294,7 +294,8 @@ def preview(request: PreviewRequest):
 
 
 @app.get("/favorites")
-def favorites(sort: str = "recent"):
+def favorites(response: Response, sort: str = "recent"):
+    response.headers["Cache-Control"] = "no-store"
     return list_favorites(sort)
 
 

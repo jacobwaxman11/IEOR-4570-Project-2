@@ -309,7 +309,7 @@ function heartButton(listing) {
         event.preventDefault();
         event.stopPropagation();
         const saved = button.getAttribute("aria-pressed") === "true";
-        toggleFavorite(listing.listing_id, !saved);
+        toggleFavorite(listing.listing_id, !saved, listing);
     });
     return button;
 }
@@ -769,6 +769,13 @@ function setTab(tab) {
     tabChats.setAttribute("aria-selected", tab === "chats" ? "true" : "false");
     tabSaved.setAttribute("aria-selected", tab === "saved" ? "true" : "false");
     renderRail();
+    if (tab !== "saved") return;
+    loadFavorites()
+        .then(() => {
+            syncHearts();
+            if (state.tab === "saved") renderRail();
+        })
+        .catch(() => {});
 }
 
 function showChats() {
@@ -815,11 +822,61 @@ async function loadThreads() {
     state.threads = data.threads || [];
 }
 
+const favoriteWrites = new Map();
+let favoriteEpoch = 0;
+let favoriteLoad = 0;
+
+function mergeListing(local, remote) {
+    const merged = { ...(local || {}), ...(remote || {}), favorited: true };
+    if (!local) return merged;
+    for (const key of ["building", "unit", "neighborhood", "beds", "baths", "sqft", "rent", "url", "deal_score", "image", "description"]) {
+        if ((merged[key] == null || merged[key] === "") && local[key] != null && local[key] !== "") {
+            merged[key] = local[key];
+        }
+    }
+    return merged;
+}
+
+function putFavorite(card) {
+    const rest = state.favorites.filter((listing) => listing.listing_id !== card.listing_id);
+    state.favorites = [card, ...rest];
+}
+
+function dropFavorite(listingId) {
+    state.favorites = state.favorites.filter((listing) => listing.listing_id !== listingId);
+}
+
 async function loadFavorites() {
-    const response = await fetch(`/favorites?sort=${encodeURIComponent(state.sort)}`);
+    const request = ++favoriteLoad;
+    const epoch = favoriteEpoch;
+    const response = await fetch(`/favorites?sort=${encodeURIComponent(state.sort)}`, { cache: "no-store" });
+    if (!response.ok) throw new Error("Couldn't load saved listings");
     const data = await response.json();
+    if (request !== favoriteLoad || epoch !== favoriteEpoch) return;
     state.sort = data.sort || state.sort;
-    state.favorites = data.listings || [];
+    const incoming = data.listings || [];
+    const incomingIds = new Set(incoming.map((listing) => listing.listing_id));
+    const pending = [];
+    const hidden = new Set();
+    for (const [listingId, write] of favoriteWrites) {
+        if (write.intent === "remove") {
+            hidden.add(listingId);
+            continue;
+        }
+        if (!incomingIds.has(listingId)) {
+            const local = state.favorites.find((listing) => listing.listing_id === listingId);
+            if (local) pending.push(local);
+        }
+    }
+    state.favorites = [
+        ...pending,
+        ...incoming
+            .filter((listing) => !hidden.has(listing.listing_id))
+            .map((listing) => mergeListing(
+                state.favorites.find((item) => item.listing_id === listing.listing_id),
+                listing,
+            )),
+    ];
 }
 
 function newChat() {
@@ -883,49 +940,62 @@ async function deleteThread(sessionId) {
     }
 }
 
-async function toggleFavorite(listingId, shouldSave) {
-    const snapshot = state.favorites.map((listing) => ({ ...listing }));
+async function toggleFavorite(listingId, shouldSave, listing) {
+    const previous = state.favorites.find((item) => item.listing_id === listingId) || null;
+    const generation = (favoriteWrites.get(listingId)?.generation || 0) + 1;
+    const mine = () => favoriteWrites.get(listingId)?.generation === generation;
+    favoriteEpoch += 1;
+    favoriteWrites.set(listingId, { generation, intent: shouldSave ? "save" : "remove" });
+    // Prod confirms the save through BigQuery. The clicked card already has
+    // rent and a photo, so Saved shows that instead of an empty placeholder.
     if (shouldSave) {
-        if (!state.favorites.some((listing) => listing.listing_id === listingId)) {
-            state.favorites = [{ listing_id: listingId }, ...state.favorites];
-        }
+        const seed = mergeListing(previous, listing || { listing_id: listingId });
+        seed.listing_id = listingId;
+        putFavorite(seed);
     } else {
-        state.favorites = state.favorites.filter((listing) => listing.listing_id !== listingId);
+        dropFavorite(listingId);
     }
     syncHearts();
     if (state.tab === "saved") renderRail();
-    const response = shouldSave
-        ? await fetch("/favorites", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ listing_id: listingId }),
-        })
-        : await fetch(`/favorites/${encodeURIComponent(listingId)}`, { method: "DELETE" });
-    if (!response.ok) {
-        state.favorites = snapshot;
-        syncHearts();
-        if (state.tab === "saved") renderRail();
-        return;
+
+    let failed = false;
+    try {
+        const response = shouldSave
+            ? await fetch("/favorites", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ listing_id: listingId }),
+            })
+            : await fetch(`/favorites/${encodeURIComponent(listingId)}`, { method: "DELETE" });
+        if (!mine()) return;
+        if (!response.ok) {
+            failed = true;
+        } else if (shouldSave) {
+            const card = await response.json().catch(() => null);
+            if (!mine()) return;
+            if (card && card.listing_id) {
+                const merged = mergeListing(listing || previous, card);
+                merged.listing_id = card.listing_id;
+                putFavorite(merged);
+            }
+        }
+    } catch {
+        if (!mine()) return;
+        failed = true;
     }
-    if (shouldSave) {
-        const card = await response.json().catch(() => null);
-        if (card && card.listing_id) {
-            state.favorites = [
-                card,
-                ...state.favorites.filter((listing) => listing.listing_id !== listingId),
-            ];
+    if (!mine()) return;
+    favoriteWrites.delete(listingId);
+    favoriteEpoch += 1;
+    try {
+        await loadFavorites();
+    } catch {
+        if (failed) {
+            if (previous) putFavorite(previous);
+            else dropFavorite(listingId);
         }
     }
     syncHearts();
-    if (shouldSave && state.tab === "saved") renderRail();
-    if (shouldSave && state.sort !== "recent") {
-        loadFavorites()
-            .then(() => {
-                syncHearts();
-                if (state.tab === "saved") renderRail();
-            })
-            .catch(() => {});
-    }
+    if (state.tab === "saved") renderRail();
 }
 
 async function send(text) {

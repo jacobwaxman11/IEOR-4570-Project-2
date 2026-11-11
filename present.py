@@ -197,6 +197,8 @@ def _cards(ids: list[str], saved: set[str] | None = None) -> list[dict]:
         return []
     saved = favorite_ids() if saved is None else saved
     placeholders = ",".join("?" * len(ids))
+    # The first-photo aggregate is limited to these ids. Grouping every photo
+    # in listing_images made each Saved click scan the whole table in prod.
     rows = _rows(
         _rentals,
             f"""
@@ -208,6 +210,7 @@ def _cards(ids: list[str], saved: set[str] | None = None) -> list[dict]:
             LEFT JOIN (
                 SELECT listing_id, MIN(position) AS position
                 FROM listing_images
+                WHERE listing_id IN ({placeholders})
                 GROUP BY listing_id
             ) first_image ON first_image.listing_id = l.listing_id
             LEFT JOIN listing_images i
@@ -215,7 +218,7 @@ def _cards(ids: list[str], saved: set[str] | None = None) -> list[dict]:
                AND i.position = first_image.position
             WHERE l.listing_id IN ({placeholders})
             """,
-            ids,
+            (*ids, *ids),
     )
     by_id = {row["listing_id"]: row for row in rows}
     cards = []
@@ -737,10 +740,12 @@ def add_favorite(listing_id: str) -> dict | None:
     if not cards:
         return None
     stamp = datetime.now(timezone.utc).isoformat()
-    if bq.prod():
-        bq.upsert_favorite(listing_id, stamp)
-    else:
-        with _ui_lock:
+    # BigQuery rejects overlapping writes to favorites. One instance queues
+    # them here; other instances retry inside the BigQuery call.
+    with _ui_lock:
+        if bq.prod():
+            bq.upsert_favorite(listing_id, stamp)
+        else:
             conn = _ui()
             try:
                 conn.execute(
@@ -759,7 +764,8 @@ def add_favorite(listing_id: str) -> dict | None:
 
 def remove_favorite(listing_id: str) -> bool:
     if bq.prod():
-        return bq.delete_favorite(listing_id)
+        with _ui_lock:
+            return bq.delete_favorite(listing_id)
     if not UI_DB.exists():
         return False
     with _ui_lock:

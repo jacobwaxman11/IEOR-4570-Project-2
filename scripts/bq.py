@@ -16,10 +16,12 @@ import json
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence, TypeVar
 
 from dotenv import load_dotenv
+from google.api_core.exceptions import GoogleAPICallError
 from google.cloud import bigquery
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -149,6 +151,8 @@ _LISTING_UPDATE = [
 ]
 
 _client: bigquery.Client | None = None
+_tables_ready = False
+_T = TypeVar("_T")
 
 
 def prod() -> bool:
@@ -326,6 +330,34 @@ def _param_value(value: Any) -> Any:
     return value if isinstance(value, str) else str(value)
 
 
+def _retryable(exc: GoogleAPICallError) -> bool:
+    """True when the job did not commit and another try can succeed.
+
+    Overlapping favorite clicks hit ``Could not serialize access`` because
+    BigQuery runs one DML statement per table at a time. Rate limits and
+    transient gateway errors fail the same way.
+    """
+    text = str(exc).lower()
+    if "serialize access" in text or "concurrent update" in text:
+        return True
+    if "ratelimitexceeded" in text or "rate limit" in text:
+        return True
+    return getattr(exc, "code", None) in (429, 500, 502, 503, 504)
+
+
+def _run(action: Callable[[], _T]) -> _T:
+    delay = 0.25
+    for attempt in range(5):
+        try:
+            return action()
+        except GoogleAPICallError as exc:
+            if attempt == 4 or not _retryable(exc):
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 2.0)
+    raise RuntimeError("BigQuery retry loop exited without a result.")
+
+
 def query(
     sql: str,
     params: Sequence[Any] = (),
@@ -333,12 +365,15 @@ def query(
     max_rows: int | None = None,
 ) -> tuple[list[str], list[list[Any]]]:
     """Run a read and return ``(column_names, rows)``."""
-    bound, parameters = bind_params(sql, params)
-    job = client().query(bound, job_config=_job_config(parameters))
-    result = job.result(max_results=max_rows)
-    columns = [field.name for field in result.schema]
-    rows = [[record[name] for name in columns] for record in result]
-    return columns, rows
+    def run() -> tuple[list[str], list[list[Any]]]:
+        bound, parameters = bind_params(sql, params)
+        job = client().query(bound, job_config=_job_config(parameters))
+        result = job.result(max_results=max_rows)
+        columns = [field.name for field in result.schema]
+        rows = [[record[name] for name in columns] for record in result]
+        return columns, rows
+
+    return _run(run)
 
 
 def query_dicts(sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
@@ -348,10 +383,13 @@ def query_dicts(sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
 
 def execute(sql: str, params: Sequence[Any] = ()) -> int:
     """Run one DML statement and return how many rows it changed."""
-    bound, parameters = bind_params(sql, params)
-    job = client().query(bound, job_config=_job_config(parameters))
-    job.result()
-    return int(job.num_dml_affected_rows or 0)
+    def run() -> int:
+        bound, parameters = bind_params(sql, params)
+        job = client().query(bound, job_config=_job_config(parameters))
+        job.result()
+        return int(job.num_dml_affected_rows or 0)
+
+    return _run(run)
 
 
 def ensure_dataset() -> None:
@@ -362,11 +400,15 @@ def ensure_dataset() -> None:
 
 def ensure_tables() -> None:
     """Create the fixed tables. ``regression_features`` is loaded with its own columns."""
+    global _tables_ready
+    if _tables_ready:
+        return
     ensure_dataset()
     bq = client()
     for name, schema in SCHEMAS.items():
         table = bigquery.Table(_table_ref(name), schema=schema)
         bq.create_table(table, exists_ok=True)
+    _tables_ready = True
 
 
 def load_rows(
@@ -460,8 +502,11 @@ def merge_row(
     parameters = [
         bigquery.ScalarQueryParameter(name, kinds[name], stored[name]) for name in columns
     ]
-    job = client().query(sql, job_config=_job_config(parameters))
-    job.result()
+    def run() -> None:
+        job = client().query(sql, job_config=_job_config(parameters))
+        job.result()
+
+    _run(run)
 
 
 def update_fields(table: str, key_column: str, key_value: Any, fields: dict[str, Any]) -> None:
@@ -642,7 +687,14 @@ def delete_favorite(listing_id: str) -> bool:
         f"DELETE FROM {quote_ident('favorites')} WHERE listing_id = ?",
         (listing_id,),
     )
-    return changed > 0
+    if changed > 0:
+        return True
+    # A retried delete can commit on the first try and report zero rows on the next.
+    left = query_dicts(
+        f"SELECT listing_id FROM {quote_ident('favorites')} WHERE listing_id = ?",
+        (listing_id,),
+    )
+    return not left
 
 
 def touch_session(session_id: str, now: str) -> None:
