@@ -879,7 +879,14 @@ async function loadFavorites() {
     ];
 }
 
+function warmMappings() {
+    // The column read is slow on a new thread. Start it while the chat is still empty.
+    // The running row is drawn later, with the other tool steps, after Send.
+    fetch("/mappings/warm", { method: "POST" }).catch(() => {});
+}
+
 function newChat() {
+    warmMappings();
     showChats();
     state.sessionId = null;
     state.title = "New chat";
@@ -1100,6 +1107,7 @@ input.addEventListener("input", () => {
 });
 
 async function init() {
+    warmMappings();
     const stored = sessionStorage.getItem(STORE);
     const pendingThread = stored
         ? fetch(`/threads/${encodeURIComponent(stored)}`).then((response) => (

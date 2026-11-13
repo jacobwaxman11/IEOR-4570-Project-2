@@ -583,29 +583,51 @@ def _load_columns(conn: sqlite3.Connection) -> list[dict]:
     return columns
 
 
-_db_lock = threading.Lock()
+# Re-entrant: a query holds this lock and then opens the connection on first use.
+_db_lock = threading.RLock()
+_columns_lock = threading.Lock()
+_mappings_lock = threading.Lock()
 _db = None
 _columns: list[dict] | None = None
+_mappings_json: str | None = None
+_mappings_started = False
 
 
 def _sqlite() -> sqlite3.Connection:
     global _db
     if _db is None:
-        _db = _open_db()
+        with _db_lock:
+            if _db is None:
+                _db = _open_db()
     return _db
 
 
 def _columns_list() -> list[dict]:
-    """Load the catalog on first use so the server can bind $PORT first."""
+    """Load the catalog on first use so the server can bind $PORT first.
+
+    The chat page starts this before anyone sends a message. A private
+    connection keeps that scan off the lock that query tools use.
+    """
     global _columns
-    if _columns is None:
-        with _db_lock:
-            if _columns is None:
-                _columns = _load_columns_bq() if bq.prod() else _load_columns(_sqlite())
+    if _columns is not None:
+        return _columns
+    with _columns_lock:
+        if _columns is None:
+            if bq.prod():
+                _columns = _load_columns_bq()
+            else:
+                conn = _open_db()
+                try:
+                    _columns = _load_columns(conn)
+                finally:
+                    conn.close()
     return _columns
 
 
 def _read_mappings() -> str:
+    global _mappings_json
+    if _mappings_json is not None:
+        return _mappings_json
     rows = []
     for column in _columns_list():
         # One-hot training columns. The chat joins regression_results, not this table.
@@ -621,7 +643,41 @@ def _read_mappings() -> str:
         if "enum_values" in column:
             row["enum_values"] = column["enum_values"]
         rows.append(row)
-    return json.dumps(rows)
+    payload = json.dumps(rows)
+    with _columns_lock:
+        if _mappings_json is None:
+            _mappings_json = payload
+        return _mappings_json
+
+
+def _warm_mappings() -> None:
+    global _mappings_started
+    try:
+        _read_mappings()
+    except BaseException:
+        with _mappings_lock:
+            _mappings_started = False
+
+
+def start_read_mappings() -> None:
+    """Read the column catalog on a background thread.
+
+    The new-chat page calls this before the user sends. A later read waits
+    on the same load instead of starting a second one.
+    """
+    global _mappings_started
+    if _mappings_json is not None:
+        return
+    with _mappings_lock:
+        if _mappings_started or _mappings_json is not None:
+            return
+        _mappings_started = True
+    threading.Thread(target=_warm_mappings, name="read-mappings", daemon=True).start()
+
+
+def load_mappings() -> str:
+    """Return the column catalog, joining a background load if one is running."""
+    return _read_mappings()
 
 
 def _split_column(column: str) -> tuple[str | None, str]:

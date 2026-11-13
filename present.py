@@ -25,6 +25,10 @@ SESSIONS_DB = ROOT / "conversations.db"
 UI_DB = ROOT / "ui.db"
 STATIC_DIR = ROOT / "static"
 
+# Background column load for a new chat. The model does not see this call.
+# The page attaches it to the user turn that follows it.
+PREFETCH_MAPPINGS_CALL_ID = "prefetch-read-mappings"
+
 LISTING_TOOLS = {
     "search_listings",
     "cheapest_in_neighborhood",
@@ -550,10 +554,26 @@ def _load_items(session_id: str) -> list[dict]:
     return items
 
 
+def _call_from(item: dict) -> dict:
+    args = item.get("arguments") or "{}"
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args else {}
+        except json.JSONDecodeError:
+            args = {"query": args} if item.get("name") == "run_sql" else {}
+    return {
+        "name": item.get("name") or "tool",
+        "args": args if isinstance(args, dict) else {},
+        "result": "",
+    }
+
+
 def _turns(items: list[dict]) -> list[dict]:
     turns = []
     current = None
     pending: dict[str, dict] = {}
+    # The column catalog is stored before the user message it belongs to.
+    leading: list[dict] = []
 
     def close():
         nonlocal current
@@ -572,22 +592,17 @@ def _turns(items: list[dict]) -> list[dict]:
     for item in items:
         kind = item.get("type")
         if kind == "function_call":
+            call = _call_from(item)
+            call_id = item.get("call_id")
+            if call_id == PREFETCH_MAPPINGS_CALL_ID:
+                leading.append(call)
+                pending[call_id] = call
+                continue
             if current is None:
                 current = {"user": "", "response": "", "tool_calls": []}
-            args = item.get("arguments") or "{}"
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args) if args else {}
-                except json.JSONDecodeError:
-                    args = {"query": args} if item.get("name") == "run_sql" else {}
-            call = {
-                "name": item.get("name") or "tool",
-                "args": args if isinstance(args, dict) else {},
-                "result": "",
-            }
             current["tool_calls"].append(call)
-            if item.get("call_id"):
-                pending[item["call_id"]] = call
+            if call_id:
+                pending[call_id] = call
             continue
         if kind == "function_call_output":
             call = pending.get(item.get("call_id"))
@@ -596,13 +611,20 @@ def _turns(items: list[dict]) -> list[dict]:
             continue
         if item.get("role") == "user":
             close()
-            current = {"user": _text_content(item.get("content")), "response": "", "tool_calls": []}
+            current = {
+                "user": _text_content(item.get("content")),
+                "response": "",
+                "tool_calls": leading,
+            }
+            leading = []
             continue
         if item.get("role") == "assistant" or kind == "message":
             if current is None:
                 current = {"user": "", "response": "", "tool_calls": []}
             text = _text_content(item.get("content"))
             current["response"] = (current["response"] + "\n\n" + text).strip() if current["response"] else text
+    if current is None and leading:
+        current = {"user": "", "response": "", "tool_calls": leading}
     close()
     return [turn for turn in turns if turn["user"] or turn["response"] or turn["tool_calls"]]
 
