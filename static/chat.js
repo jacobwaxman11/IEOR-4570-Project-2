@@ -415,6 +415,9 @@ function resultSummary(call) {
     if (data && Array.isArray(data.amenities)) return `${data.amenities.length} amenities`;
     if (data && Array.isArray(data.neighborhoods)) return `${data.neighborhoods.length} neighborhoods`;
     if (Array.isArray(data)) return `${data.length} fields`;
+    if (data && Array.isArray(data.columns) && !Array.isArray(data.rows)) {
+        return `${data.columns.length} fields`;
+    }
     return "Done";
 }
 
@@ -438,6 +441,7 @@ const STEP_LABELS = {
     read_mappings: "Reading the table columns",
     get_enum_values: "Checking allowed values",
     run_sql: "Running a query",
+    search_places: "Searching places",
 };
 
 function stepLabel(name) {

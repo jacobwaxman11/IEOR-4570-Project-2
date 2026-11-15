@@ -158,7 +158,7 @@ Or authenticate with Application Default Credentials instead of a key file:
 gcloud auth application-default login
 ```
 
-`GOOGLE_CLOUD_LOCATION` defaults to `global` and is read by the photo scorer. The chat model is pinned to Vertex location `global`. `GOOGLE_MAPS_API_KEY` is only used by Places and Routes helpers in `tools.py`; those helpers are not registered on the agent.
+`GOOGLE_CLOUD_LOCATION` defaults to `global` and is read by the photo scorer. The chat model is pinned to Vertex location `global`. `GOOGLE_MAPS_API_KEY` is used by `search_places`, which is registered on the agent. The Routes helper in `tools.py` is not registered.
 
 Listing data also lives in BigQuery, in dataset `IEOR_4570_Project_2` (dataset ids cannot contain hyphens) in location `US`. `BQ_LOCATION` overrides that location. `GOOGLE_CLOUD_LOCATION` is not a BigQuery location.
 

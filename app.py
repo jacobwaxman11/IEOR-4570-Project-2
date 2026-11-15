@@ -35,6 +35,7 @@ from scripts import bq
 from session_store import open_session
 from tools import (
     ANALYSIS_TOOLS,
+    PLACES_TOOLS,
     get_enum_values,
     load_mappings,
     read_mappings,
@@ -61,16 +62,19 @@ Tables:
 - regression_results: predicted rent, actual rent, percent discount, and deal score for active listings. Join to listings on listing_id.
 
 Which tool to use:
-- Filtered search by neighborhood, beds, baths, sqft, or rent: search_listings.
+- Filtered search by neighborhood, beds, baths, sqft, rent, or amenities: search_listings.
 - Cheapest units in a neighborhood: cheapest_in_neighborhood.
 - Amenities for a building: get_building_amenities.
 - Model deals: get_deals. Best deals in one neighborhood: best_deals_in_neighborhood.
 - Compare rents across neighborhoods: compare_neighborhoods.
 - A short profile of one neighborhood: summarize_neighborhood.
+- A listing's location, or any other place question: search_places. Pass the listing street and neighborhood. Do not locate a unit with street LIKE or another fuzzy address match.
 - Anything else: read_mappings, then get_enum_values before filtering an enum, then run_sql.
 
 - When writing SQL, call read_mappings first.
 - Before filtering on an enum column in SQL, call get_enum_values. Never guess values.
+- Area names such as Upper East Side are not stored on listings.neighborhood. area_aliases in the column catalog lists each name and the neighborhoods to filter on.
+- When run_sql returns listing rows, stop. Do not call run_sql again on that question. Answer from those rows. Select every column the answer needs in that one query. A location question calls search_places after that query, for the listings being answered, and does not run another SQL query.
 - Missing values are NULL. Exclude them from filters, groups, and aggregates. A missing sqft should not hide a listing from a size filter.
 - Return active listings unless the user asks about another status. Add `listing_status = 'ACTIVE'` to every query that returns or aggregates listings. Drop that filter only when the user asks about rented, delisted, in-contract, off-market, or another status.
 - Quote an apostrophe in a SQL string as two apostrophes, as in 'Hell''s Kitchen'.
@@ -137,7 +141,7 @@ agent = Agent(
     instructions=_INSTRUCTIONS,
     model=LitellmModel(model="vertex_ai/gemini-3.8-flash", api_key="unused"),
     model_settings=ModelSettings(extra_args={"vertex_location": "global"}),
-    tools=[read_mappings, get_enum_values, run_sql, *ANALYSIS_TOOLS],
+    tools=[read_mappings, get_enum_values, run_sql, *ANALYSIS_TOOLS, *PLACES_TOOLS],
 )
 
 
@@ -166,8 +170,9 @@ def _with_catalog(instructions: str, catalog: str) -> str:
     )
     return (
         text
-        + "\n\nColumn catalog. Each entry has table, name, type, description, is_enum, "
-        + "and enum_values when the enum is small. Do not call read_mappings.\n"
+        + "\n\nColumn catalog. `columns` lists table, name, type, description, is_enum, "
+        + "and enum_values when the enum is small. `area_aliases` maps an area name to the "
+        + "neighborhood values stored on listings. Do not call read_mappings.\n"
         + catalog
     )
 

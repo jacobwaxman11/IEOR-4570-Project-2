@@ -11,7 +11,12 @@ import time
 from pathlib import Path
 
 import requests
-from agents import ToolGuardrailFunctionOutput, function_tool, tool_input_guardrail
+from agents import (
+    ToolGuardrailFunctionOutput,
+    function_tool,
+    tool_input_guardrail,
+    tool_output_guardrail,
+)
 from dotenv import load_dotenv
 
 from scripts import bq
@@ -163,7 +168,21 @@ def _google_headers(field_mask: str) -> dict:
 
 @_tool
 def search_places(query: str, location: str = "New York, NY", limit: int = 5) -> dict:
-    """Find places in NYC, with ratings and up to two review excerpts each."""
+    """Find a place in New York via Google Places, with its address and coordinates.
+
+    Use this for a listing's location. Pass the listing street as the query and the
+    neighborhood as the location, with limit 1. Use the returned address and coordinates.
+    Do not match the address with a street LIKE filter or another fuzzy address match.
+
+    Also use this for any other place question, such as a restaurant, a subway stop,
+    or what is nearby. Pass that place as the query and the neighborhood as the location.
+    Call it for the listings you are answering about, not for every row in a large result.
+
+    Args:
+        query: A listing street, or the place to find, such as '225 East 63rd Street' or 'ramen'.
+        location: Neighborhood or borough. Defaults to 'New York, NY'. Example: 'Yorkville, New York, NY'.
+        limit: How many places to return, 1 to 5. Use 1 for a listing address. Defaults to 5.
+    """
     query = _clean(query)
     location = _clean(location) or "New York, NY"
     if not query:
@@ -276,18 +295,26 @@ TOOLS = [
         "function": {
             "name": "search_places",
             "description": (
-                "Find restaurants, bars, attractions, museums, and activities in New York City via Google Places. "
-                "Returns address, rating, rating count, price, types, coordinates, a Maps link, and up to two review excerpts."
+                "Find a place in New York via Google Places, including a listing's location. "
+                "Pass the listing street as the query and the neighborhood as the location. "
+                "Also use this for a restaurant, a subway stop, or what is nearby. "
+                "Returns address, coordinates, rating, a Maps link, and up to two review excerpts."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "What to find, e.g. 'ramen', 'art museums', or 'jazz bar'."},
+                    "query": {
+                        "type": "string",
+                        "description": "A listing street, or the place to find, such as '225 East 63rd Street' or 'ramen'.",
+                    },
                     "location": {
                         "type": "string",
-                        "description": "Neighborhood or borough. Defaults to 'New York, NY'. Example: 'Williamsburg, Brooklyn'.",
+                        "description": "Neighborhood or borough. Defaults to 'New York, NY'. Example: 'Yorkville, New York, NY'.",
                     },
-                    "limit": {"type": "integer", "description": "How many places to return, 1 to 5. Defaults to 5."},
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many places to return, 1 to 5. Use 1 for a listing address. Defaults to 5.",
+                    },
                 },
                 "required": ["query"],
             },
@@ -341,8 +368,7 @@ def run_tool(name: str, args: dict) -> str:
 
 # --- Text2SQL ---
 #
-# The Maps tools above stay in this file for later. The agent registers only
-# read_mappings, get_enum_values, and run_sql.
+# search_places is registered on the agent. get_directions stays in this file.
 
 DB_PATH = Path(__file__).parent / "scripts" / "rentals.db"
 MAX_ROWS = 100
@@ -396,7 +422,10 @@ _SHARED_DESCRIPTIONS = {
     "url": "StreetEasy listing URL.",
     "name": "Building or listing name.",
     "street": "Street address.",
-    "neighborhood": "NYC neighborhood.",
+    "neighborhood": (
+        "NYC neighborhood stored on the listing. Area names such as Upper East Side "
+        "are not values of this column. Use area_aliases from read_mappings."
+    ),
     "zip": "ZIP code.",
     "lat": "Latitude.",
     "lng": "Longitude.",
@@ -643,7 +672,10 @@ def _read_mappings() -> str:
         if "enum_values" in column:
             row["enum_values"] = column["enum_values"]
         rows.append(row)
-    payload = json.dumps(rows)
+    payload = json.dumps({
+        "columns": rows,
+        "area_aliases": _area_alias_catalog(),
+    })
     with _columns_lock:
         if _mappings_json is None:
             _mappings_json = payload
@@ -728,6 +760,14 @@ def _is_read_only(query: str) -> bool:
     return _WRITE_SQL.search(text) is None
 
 
+def _is_listing_search(query: str, columns: list, rows: list) -> bool:
+    """True when a query returned listing rows the answer can use."""
+    if not rows or not re.search(r"\blistings\b", query, re.IGNORECASE):
+        return False
+    names = {str(column).lower() for column in columns}
+    return "listing_id" in names and "rent" in names
+
+
 def _run_sql(query: str) -> str:
     """The SDK runs tools on worker threads. One lock keeps the shared connection safe."""
     if bq.prod():
@@ -735,34 +775,80 @@ def _run_sql(query: str) -> str:
             columns, rows = bq.query(query, max_rows=MAX_ROWS + 1)
         except Exception as e:
             return json.dumps({"error": str(e)})
-        return json.dumps(
-            {
-                "columns": columns,
-                "rows": rows[:MAX_ROWS],
-                "truncated": len(rows) > MAX_ROWS,
-            },
-            default=str,
-        )
-    with _db_lock:
-        try:
-            cursor = _sqlite().execute(query)
-            rows = cursor.fetchmany(MAX_ROWS + 1)
-            columns = [desc[0] for desc in cursor.description or []]
-        except sqlite3.Error as e:
-            return json.dumps({"error": str(e)})
-    return json.dumps(
-        {
+        payload = {
+            "columns": columns,
+            "rows": rows[:MAX_ROWS],
+            "truncated": len(rows) > MAX_ROWS,
+        }
+    else:
+        with _db_lock:
+            try:
+                cursor = _sqlite().execute(query)
+                rows = cursor.fetchmany(MAX_ROWS + 1)
+                columns = [desc[0] for desc in cursor.description or []]
+            except sqlite3.Error as e:
+                return json.dumps({"error": str(e)})
+        payload = {
             "columns": columns,
             "rows": [list(row) for row in rows[:MAX_ROWS]],
             "truncated": len(rows) > MAX_ROWS,
-        },
-        default=str,
-    )
+        }
+    if _is_listing_search(query, payload["columns"], payload["rows"]):
+        payload["stop"] = (
+            "These rows are the search result. Do not call run_sql again. "
+            "A location question calls search_places for the listings you are answering about."
+        )
+    return json.dumps(payload, default=str)
+
+
+# One flag per agent run. Tool calls in that run share the run's usage object.
+# The next user message starts a new run, so a later question can query again.
+_SEARCH_DONE = "_sql_search_done"
+
+
+def _mark_search_done(ctx) -> None:
+    usage = getattr(ctx, "usage", None)
+    if usage is not None:
+        object.__setattr__(usage, _SEARCH_DONE, True)
+
+
+def _search_is_done(ctx) -> bool:
+    usage = getattr(ctx, "usage", None)
+    return bool(usage is not None and getattr(usage, _SEARCH_DONE, False))
+
+
+@tool_input_guardrail
+def finished_search(data) -> ToolGuardrailFunctionOutput:
+    """Refuse another query once this run already has its listing rows."""
+    if _search_is_done(data.context):
+        return ToolGuardrailFunctionOutput.reject_content(
+            "The search already returned listings. This call was refused. "
+            "Do not call run_sql again. For a location, call search_places."
+        )
+    return ToolGuardrailFunctionOutput.allow()
+
+
+@tool_output_guardrail
+def remember_search(data) -> ToolGuardrailFunctionOutput:
+    """Remember a listing search that returned rows, so the next call can be refused."""
+    output = data.output
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except json.JSONDecodeError:
+            output = None
+    if isinstance(output, dict) and output.get("stop"):
+        _mark_search_done(data.context)
+    return ToolGuardrailFunctionOutput.allow()
 
 
 @function_tool
 def read_mappings() -> str:
-    """Read rental table columns: table, name, type, a description, and enum values for a small enum.
+    """Read rental table columns and area aliases.
+
+    Columns include table, name, type, a description, and enum values for a small enum.
+    area_aliases maps a name such as Upper East Side to the neighborhood values stored
+    on listings. That name is not itself a neighborhood. Filter with the listed neighborhoods.
 
     Call this only when no analysis tool can answer the question. Small enums such as
     neighborhood and listing_status include their values here. Call get_enum_values only
@@ -795,12 +881,19 @@ def read_only_sql(data) -> ToolGuardrailFunctionOutput:
     return ToolGuardrailFunctionOutput.allow()
 
 
-@function_tool(tool_input_guardrails=[read_only_sql])
+@function_tool(
+    tool_input_guardrails=[read_only_sql, finished_search],
+    tool_output_guardrails=[remember_search],
+)
 def run_sql(query: str) -> str:
     """Run one read-only query against the rental database and return the rows.
 
     Queries that return or aggregate listings must filter listing_status = 'ACTIVE'
     unless the user asked for another status.
+
+    When the result includes listing rows, stop. Do not call run_sql again for this
+    question. A later call is refused. Put every column the answer needs in this one
+    query. A location question still calls search_places after that.
 
     Args:
         query: A single SELECT or WITH query.
@@ -856,6 +949,13 @@ def _resolve_neighborhood(name: str) -> str:
     for neighborhood in neighborhoods:
         if neighborhood.casefold() == cleaned.casefold():
             return neighborhood
+    alias = _AREA_ALIASES.get(cleaned.casefold())
+    if alias:
+        raise ToolError(
+            f"'{cleaned}' covers more than one neighborhood: {', '.join(alias)}. "
+            "search_listings takes one neighborhood. Call it once per neighborhood, "
+            "or filter SQL with those names."
+        )
     raise ToolError(
         f"No neighborhood '{cleaned}'. Valid neighborhoods: {', '.join(neighborhoods)}."
     )
@@ -894,6 +994,76 @@ def _resolve_areas(neighborhoods) -> list[str]:
         if canonical is None:
             raise ToolError(
                 f"No neighborhood '{part}'. Valid neighborhoods: {', '.join(known.values())}."
+            )
+        if canonical not in resolved:
+            resolved.append(canonical)
+    return resolved
+
+
+def _alias_label(alias: str) -> str:
+    if len(alias) <= 3 and alias.isalpha():
+        return alias.upper()
+    return str(alias).title()
+
+
+def _area_alias_catalog() -> dict:
+    """Area names resolved to the neighborhood values stored on listings."""
+    grouped: dict[tuple[str, ...], list[str]] = {}
+    for alias, names in _AREA_ALIASES.items():
+        grouped.setdefault(tuple(names), []).append(alias)
+    areas = []
+    for aliases in grouped.values():
+        try:
+            neighborhoods = _resolve_areas(aliases[0])
+        except ToolError:
+            continue
+        if not neighborhoods:
+            continue
+        areas.append({
+            "names": [_alias_label(alias) for alias in sorted(aliases, key=len, reverse=True)],
+            "neighborhoods": neighborhoods,
+        })
+    return {
+        "description": (
+            "These names are not stored on listings.neighborhood. "
+            "Filter with the neighborhoods listed for the name."
+        ),
+        "areas": areas,
+    }
+
+
+def _amenity_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value).casefold()).strip("_")
+
+
+def _amenity_values() -> list[str]:
+    match = next(
+        (c for c in _columns_list() if c["table"] == "listing_amenities" and c["name"] == "amenity"),
+        None,
+    )
+    values = (match or {}).get("enum_values")
+    if values:
+        return list(values)
+    return [
+        row["amenity"]
+        for row in _query_rows(
+            "SELECT DISTINCT amenity FROM listing_amenities "
+            "WHERE amenity IS NOT NULL ORDER BY amenity"
+        )
+    ]
+
+
+def _resolve_amenities(amenities) -> list[str]:
+    """Match requested amenities to stored tags. A listing must have every one."""
+    if amenities is None or amenities == "" or amenities == []:
+        return []
+    known = {_amenity_key(name): name for name in _amenity_values()}
+    resolved = []
+    for part in _split_names(amenities):
+        canonical = known.get(_amenity_key(part))
+        if canonical is None:
+            raise ToolError(
+                f"No amenity '{part}'. Valid amenities: {', '.join(sorted(known.values()))}."
             )
         if canonical not in resolved:
             resolved.append(canonical)
@@ -958,9 +1128,13 @@ def search_listings(
     max_sqft: float | None = None,
     min_rent: float | None = None,
     max_rent: float | None = None,
+    amenities: str | None = None,
     limit: int = 10,
 ) -> dict:
-    """Find active listings by neighborhood, bedrooms, bathrooms, square feet, and rent.
+    """Find active listings by neighborhood, bedrooms, bathrooms, square feet, rent, and amenities.
+
+    Use this when the user wants units that have specific amenities, such as a doorman
+    and an elevator. A listing must have every amenity named here.
 
     Args:
         neighborhood: Neighborhood name, such as 'Chelsea' or 'Hell's Kitchen'. Optional.
@@ -971,6 +1145,7 @@ def search_listings(
         max_sqft: Maximum square feet. Listings with no sqft are kept. Optional.
         min_rent: Minimum monthly rent. Optional.
         max_rent: Maximum monthly rent. Optional.
+        amenities: Required amenities, such as 'doorman, elevator'. Optional.
         limit: How many listings to return, 1 to 25. Defaults to 10.
     """
     limit = _clamp_int(limit, 10, 1, 25)
@@ -981,6 +1156,7 @@ def search_listings(
     max_sqft = _optional_number(max_sqft, "max_sqft")
     min_rent = _optional_number(min_rent, "min_rent")
     max_rent = _optional_number(max_rent, "max_rent")
+    required = _resolve_amenities(amenities)
 
     clauses = ["listing_status = 'ACTIVE'"]
     params: list = []
@@ -989,6 +1165,12 @@ def search_listings(
         resolved = _resolve_neighborhood(neighborhood)
         clauses.append("neighborhood = ?")
         params.append(resolved)
+    for amenity in required:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM listing_amenities a "
+            "WHERE a.listing_id = listings.listing_id AND a.amenity = ?)"
+        )
+        params.append(amenity)
     if min_beds is not None:
         clauses.append("beds >= ?")
         params.append(min_beds)
@@ -1030,6 +1212,7 @@ def search_listings(
         "max_sqft": max_sqft,
         "min_rent": min_rent,
         "max_rent": max_rent,
+        "amenities": required or None,
     }
     return {
         "neighborhood": resolved,
@@ -1289,4 +1472,8 @@ ANALYSIS_TOOLS = [
     _agent_tool(best_deals_in_neighborhood),
     _agent_tool(compare_neighborhoods),
     _agent_tool(summarize_neighborhood),
+]
+
+PLACES_TOOLS = [
+    _agent_tool(search_places),
 ]

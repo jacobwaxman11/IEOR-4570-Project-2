@@ -485,7 +485,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--timeout-ms",
         type=int,
-        default=60_000,
+        default=90_000,
         help="Per-call Gemini HTTP timeout in milliseconds",
     )
     p.add_argument(
