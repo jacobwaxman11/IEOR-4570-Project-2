@@ -2,7 +2,7 @@
 
 A chat agent for someone comparing Manhattan rentals. The target user is a renter, or a friend helping one, who wants a unit in Manhattan. They ask which listings match a neighborhood, bedroom count, and budget, what a building includes, how two neighborhoods compare, and which units a rent model marks as underpriced.
 
-The page streams each tool call, then shows the answer with listing cards the user can save. The model is Gemini on Vertex AI (`gemini-3.8-flash`), reached through the OpenAI Agents SDK and LiteLLM. Listing data lives in SQLite. SQL the model writes is read-only.
+The page streams each tool call, then shows the answer with listing cards the user can save. The model is Gemini on Vertex AI (`gemini-3.8-flash`), reached through the OpenAI Agents SDK and LiteLLM. Listing data lives in SQLite. SQL the model writes is read-only. Location questions use Google Places (`search_places`).
 
 ## Data
 
@@ -132,6 +132,7 @@ This agent answered 63 West 104th Street #101, Manhattan Valley, $5,000, predict
 - Amenities for one building.
 - A short neighborhood profile, or a rent comparison across neighborhoods.
 - Deals from the rent model: predicted rent, listed rent, percent discount, and a 0–10 deal score.
+- A listing's location, or another place in New York, through Google Places (`search_places`).
 
 `get_deals` maps a few names renters use onto the stored neighborhoods. "UES" and "Upper East Side" cover Carnegie Hill, Lenox Hill, Yorkville, and Sutton Place. "UWS" and "Upper West Side" cover Upper West Side, Lincoln Square, Manhattan Valley, and Morningside Heights. There is no `listings.neighborhood` value equal to "Upper East Side".
 
@@ -192,7 +193,7 @@ Photo scoring needs the same Vertex credentials as the chat. It sends local imag
 | Path                             | Role                                                       |
 | -------------------------------- | ---------------------------------------------------------- |
 | `app.py`                         | FastAPI chat server, agent, and SSE stream of tool calls   |
-| `tools.py`                       | Read-only SQL tools and the analysis tools the agent calls |
+| `tools.py`                       | Read-only SQL, analysis tools, and `search_places`     |
 | `present.py`                     | Listing cards, chat history, and saved listings            |
 | `index.html`, `static/`          | Chat page                                                  |
 | `scripts/db.py`                  | SQLite schema and write helpers, mirrored to BigQuery      |
