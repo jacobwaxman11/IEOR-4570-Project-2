@@ -105,7 +105,7 @@ def open_session(session_id: str):
 
 
 _MAX_SESSION_ID = 128
-_MAX_USER_ID = 64
+_MAX_USER_ID = 128
 
 
 def _ids_ok(session_id: str, user_id: str) -> bool:

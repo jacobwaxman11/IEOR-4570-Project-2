@@ -128,8 +128,38 @@ SCHEMAS: dict[str, list[bigquery.SchemaField]] = {
         ("scored_at", "STRING"),
     ),
     "favorites": _columns(
+        ("account_id", "STRING"),
         ("listing_id", "STRING"),
         ("favorited_at", "STRING"),
+    ),
+    "accounts": _columns(
+        ("account_id", "STRING"),
+        ("email", "STRING"),
+        ("name", "STRING"),
+        ("created_at", "STRING"),
+    ),
+    "renter_profiles": _columns(
+        ("account_id", "STRING"),
+        ("max_rent", "FLOAT64"),
+        ("min_beds", "FLOAT64"),
+        ("neighborhoods", "STRING"),
+        ("work_address", "STRING"),
+        ("commute_mode", "STRING"),
+        ("last_commute", "STRING"),
+        ("updated_at", "STRING"),
+    ),
+    "tool_cache": _columns(
+        ("account_id", "STRING"),
+        ("tool", "STRING"),
+        ("args_hash", "STRING"),
+        ("payload", "STRING"),
+        ("expires_at", "STRING"),
+    ),
+    "pending_runs": _columns(
+        ("session_id", "STRING"),
+        ("account_id", "STRING"),
+        ("state_json", "STRING"),
+        ("created_at", "STRING"),
     ),
     "agent_sessions": _columns(
         ("session_id", "STRING"),
@@ -414,6 +444,10 @@ def ensure_tables() -> None:
         f"ALTER TABLE {quote_ident('agent_sessions')} "
         "ADD COLUMN IF NOT EXISTS user_id STRING"
     )
+    execute(
+        f"ALTER TABLE {quote_ident('favorites')} "
+        "ADD COLUMN IF NOT EXISTS account_id STRING"
+    )
     _tables_ready = True
 
 
@@ -678,27 +712,27 @@ def _series_kind(series: Any) -> str:
     return "STRING"
 
 
-def upsert_favorite(listing_id: str, favorited_at: str) -> None:
+def upsert_favorite(account_id: str, listing_id: str, favorited_at: str) -> None:
     ensure_tables()
     merge_row(
         "favorites",
-        ["listing_id"],
-        {"listing_id": listing_id, "favorited_at": favorited_at},
+        ["account_id", "listing_id"],
+        {"account_id": account_id, "listing_id": listing_id, "favorited_at": favorited_at},
     )
 
 
-def delete_favorite(listing_id: str) -> bool:
+def delete_favorite(account_id: str, listing_id: str) -> bool:
     ensure_tables()
     changed = execute(
-        f"DELETE FROM {quote_ident('favorites')} WHERE listing_id = ?",
-        (listing_id,),
+        f"DELETE FROM {quote_ident('favorites')} WHERE account_id = ? AND listing_id = ?",
+        (account_id, listing_id),
     )
     if changed > 0:
         return True
     # A retried delete can commit on the first try and report zero rows on the next.
     left = query_dicts(
-        f"SELECT listing_id FROM {quote_ident('favorites')} WHERE listing_id = ?",
-        (listing_id,),
+        f"SELECT listing_id FROM {quote_ident('favorites')} WHERE account_id = ? AND listing_id = ?",
+        (account_id, listing_id),
     )
     return not left
 

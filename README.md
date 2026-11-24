@@ -125,6 +125,29 @@ This agent answered 63 West 104th Street #101, Manhattan Valley, $5,000, predict
 
 
 
+## Signed-in profile, charts, and maps
+
+The chat requires a Google sign-in. Set `GOOGLE_CLIENT_ID` to the OAuth client id for this app. The account id is the Google subject. Chats, saved listings, and the renter profile are stored for that account, in `ui.db` locally and in BigQuery when `APP_ENV=prod`.
+
+A profile holds a budget, a minimum bedroom count, neighborhoods, a work address, and the last commute. The model calls `save_profile` when the user states one of those. The page asks the user to approve or reject the change before it is written. A new chat for the same account reads the profile, so "under my budget" and "to work" keep their meaning. Places and Routes answers are cached on the account for 24 hours. Chart aggregates are cached for one hour for every account, because the rental rows are shared.
+
+Follow-up buttons under an answer send that sentence as the next message. They are built from the listings and charts already on screen.
+
+`average_rent_by_neighborhood` draws a bar chart of average rent. `average_rent_by_unit_type` draws the same kind of bar for studios, 1-bedrooms, 2-bedrooms, and 3+ bedrooms. `listing_mix` draws a pie chart by neighborhood or by apartment type. `neighborhood_price_map` draws a circle on each neighborhood, colored by average rent. Aggregate `run_sql` results get a chart of the same shape when the question asks for one.
+
+`commute_from_listing` calls Google Routes for up to four listings and draws the route. The destination can be the saved work address. `neighborhood_activities` calls Google Places for things to do. `show_listing_map` pins a unit from the coordinates stored on the listing, or geocodes the street once. The map uses the Maps JavaScript API and `GOOGLE_MAPS_API_KEY`. The key has to allow this page's origin.
+
+Langfuse is optional. Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_HOST`. Each chat turn is a trace, each tool call is a span, and each `run_sql` span is scored for a read-only statement, a successful run, an active-listing filter, known enum values, and the row count. `uv run scripts/eval_sql.py` checks the gold questions against the local database and, when those keys are set, writes them to the Langfuse dataset `rental-sql-gold` with a `sql_expected_hit` score. `uv run scripts/eval_sql.py --agent` also runs the chat agent.
+
+Questions to try after signing in:
+
+- "What is the average rent by neighborhood?"
+- "What is the average rent by apartment type?"
+- "Break down listings by neighborhood."
+- "Show a neighborhood heat map of average rent."
+- "Remember that I want a 1-bedroom under $5,000 and I work at Hudson Yards." Approve the profile, open a new chat, and ask "1-bedrooms under my budget."
+- On a listing answer, click "How long from {street} to Hudson Yards?" and then "What's there to do in {neighborhood}?"
+
 ## What you can ask
 
 - Filtered search: neighborhood, beds, baths, square feet, rent.
@@ -159,7 +182,7 @@ Or authenticate with Application Default Credentials instead of a key file:
 gcloud auth application-default login
 ```
 
-`GOOGLE_CLOUD_LOCATION` defaults to `global` and is read by the photo scorer. The chat model is pinned to Vertex location `global`. `GOOGLE_MAPS_API_KEY` is used by `search_places`, which is registered on the agent. The Routes helper in `tools.py` is not registered.
+`GOOGLE_CLOUD_LOCATION` defaults to `global` and is read by the photo scorer. The chat model is pinned to Vertex location `global`. `GOOGLE_MAPS_API_KEY` is used by Places, Routes, and the map on the page. That key's HTTP referrer restriction has to allow `http://localhost:8001` and the Cloud Run origin. `GOOGLE_CLIENT_ID` is the OAuth client id for Google sign-in. `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_HOST` are optional. Empty Langfuse keys leave the chat running and skip traces.
 
 Listing data also lives in BigQuery, in dataset `IEOR_4570_Project_2` (dataset ids cannot contain hyphens) in location `US`. `BQ_LOCATION` overrides that location. `GOOGLE_CLOUD_LOCATION` is not a BigQuery location.
 
@@ -193,8 +216,11 @@ Photo scoring needs the same Vertex credentials as the chat. It sends local imag
 | Path                             | Role                                                       |
 | -------------------------------- | ---------------------------------------------------------- |
 | `app.py`                         | FastAPI chat server, agent, and SSE stream of tool calls   |
-| `tools.py`                       | Read-only SQL, analysis tools, and `search_places`     |
-| `present.py`                     | Listing cards, chat history, and saved listings            |
+| `tools.py`                       | Read-only SQL, analysis tools, charts, Places, and Routes |
+| `present.py`                     | Listing cards, charts, maps, follow-ups, and saved listings |
+| `accounts.py`                    | Google accounts, renter profiles, and the tool cache     |
+| `observe.py`                     | Langfuse traces and SQL scores                           |
+| `scripts/eval_sql.py`            | Gold SQL and chart checks, posted to Langfuse when configured |
 | `index.html`, `static/`          | Chat page                                                  |
 | `scripts/db.py`                  | SQLite schema and write helpers, mirrored to BigQuery      |
 | `scripts/bq.py`                  | BigQuery dataset, loads, and merges                        |

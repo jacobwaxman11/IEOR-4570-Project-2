@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 
 from google.api_core.exceptions import GoogleAPICallError
 
+import accounts
+import followups
 from scripts import bq
 
 ROOT = Path(__file__).parent
@@ -34,6 +36,7 @@ LISTING_TOOLS = {
     "cheapest_in_neighborhood",
     "get_deals",
     "best_deals_in_neighborhood",
+    "commute_from_listing",
 }
 
 SORTS = {"recent", "rent_asc", "rent_desc", "neighborhood", "beds", "deal"}
@@ -70,22 +73,7 @@ _tls = threading.local()
 
 
 def init_ui() -> None:
-    if bq.prod():
-        return
-    with _ui_lock:
-        conn = sqlite3.connect(UI_DB)
-        try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS favorites (
-                    listing_id TEXT PRIMARY KEY,
-                    favorited_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
+    accounts.ensure_schema()
 
 
 def _rentals():
@@ -155,10 +143,17 @@ def _rows(connect, sql: str, params: tuple | list = ()) -> list[dict]:
             conn.close()
 
 
-def favorite_ids() -> set[str]:
-    if not _ui_ready():
+def favorite_ids(account_id: str | None) -> set[str]:
+    if not account_id or not _ui_ready():
         return set()
-    return {row["listing_id"] for row in _rows(_ui, "SELECT listing_id FROM favorites")}
+    return {
+        row["listing_id"]
+        for row in _rows(
+            _ui,
+            "SELECT listing_id FROM favorites WHERE account_id = ?",
+            (account_id,),
+        )
+    }
 
 
 def _clip(text, limit: int = 320) -> str | None:
@@ -199,16 +194,16 @@ def _number(value):
 def _cards(ids: list[str], saved: set[str] | None = None) -> list[dict]:
     if not ids or not _rentals_ready():
         return []
-    saved = favorite_ids() if saved is None else saved
+    saved = set() if saved is None else saved
     placeholders = ",".join("?" * len(ids))
     # The first-photo aggregate is limited to these ids. Grouping every photo
     # in listing_images made each Saved click scan the whole table in prod.
     rows = _rows(
         _rentals,
             f"""
-            SELECT l.listing_id, l.name AS building, l.unit, l.neighborhood,
+            SELECT l.listing_id, l.name AS building, l.street, l.unit, l.neighborhood,
                    l.beds, l.baths, l.sqft, l.rent, l.url, l.listing_status,
-                   l.description, r.deal_score, i.image_url
+                   l.lat, l.lng, l.description, r.deal_score, i.image_url
             FROM listings l
             LEFT JOIN regression_results r ON r.listing_id = l.listing_id
             LEFT JOIN (
@@ -235,8 +230,11 @@ def _cards(ids: list[str], saved: set[str] | None = None) -> list[dict]:
         cards.append({
             "listing_id": listing_id,
             "building": row["building"],
+            "street": row["street"],
             "unit": row["unit"],
             "neighborhood": row["neighborhood"],
+            "lat": _number(row["lat"]),
+            "lng": _number(row["lng"]),
             "beds": _number(row["beds"]),
             "baths": _number(row["baths"]),
             "sqft": _number(row["sqft"]),
@@ -250,12 +248,12 @@ def _cards(ids: list[str], saved: set[str] | None = None) -> list[dict]:
     return cards
 
 
-def cards_for(ids: list[str]) -> list[dict]:
+def cards_for(ids: list[str], account_id: str | None = None) -> list[dict]:
     seen = []
     for listing_id in ids:
         if listing_id and listing_id not in seen:
             seen.append(str(listing_id))
-    return _cards(seen)
+    return _cards(seen, saved=favorite_ids(account_id))
 
 
 def _parse_result(result) -> object | None:
@@ -280,6 +278,8 @@ def _refs_from_call(call: dict) -> list[dict]:
             if isinstance(row, dict) and row.get("listing_id"):
                 refs.append({"listing_id": str(row["listing_id"])})
         return refs
+    if name == "show_listing_map" and data.get("listing_id"):
+        return [{"listing_id": str(data["listing_id"])}]
     if name != "run_sql":
         return []
     columns = [str(column).lower() for column in data.get("columns") or []]
@@ -476,51 +476,142 @@ def _mentioned(answer: str, cards: list[dict]) -> list[dict]:
     return [card for _, card in found]
 
 
-def resolve_display(question: str, tool_calls: list[dict], answer: str | None = None) -> dict:
+def _pin(label, lat, lng, kind: str, listing_id: str | None = None) -> dict | None:
+    if lat is None or lng is None:
+        return None
+    pin = {"label": label or "Place", "lat": lat, "lng": lng, "kind": kind}
+    if listing_id:
+        pin["listing_id"] = listing_id
+    return pin
+
+
+def _visuals(tool_calls: list[dict]) -> tuple[list[dict], dict]:
+    charts = []
+    pins = []
+    circles = []
+    routes = []
+    for call in tool_calls or []:
+        data = _parse_result(call.get("result"))
+        if not isinstance(data, dict) or data.get("error"):
+            continue
+        chart = data.get("chart")
+        if isinstance(chart, dict) and chart.get("points"):
+            charts.append(chart)
+            if chart.get("type") == "map":
+                for point in chart.get("points") or []:
+                    if isinstance(point, dict) and point.get("lat") is not None:
+                        circles.append(point)
+        name = call.get("name")
+        if name in {"neighborhood_activities", "search_places"}:
+            for place in data.get("places") or []:
+                if not isinstance(place, dict):
+                    continue
+                pin = _pin(place.get("name") or place.get("address"), place.get("lat"), place.get("lng"), "place")
+                if pin:
+                    pins.append(pin)
+        if name == "show_listing_map":
+            pin = _pin(data.get("street") or data.get("building"), data.get("lat"), data.get("lng"), "listing", data.get("listing_id"))
+            if pin:
+                pins.append(pin)
+        if name == "commute_from_listing":
+            for row in data.get("listings") or []:
+                if not isinstance(row, dict) or row.get("error"):
+                    continue
+                pin = _pin(row.get("street") or row.get("building"), row.get("lat"), row.get("lng"), "listing", row.get("listing_id"))
+                if pin:
+                    pins.append(pin)
+                if row.get("encoded_polyline"):
+                    routes.append({
+                        "listing_id": row.get("listing_id"),
+                        "origin": row.get("origin"),
+                        "destination": row.get("destination") or data.get("destination"),
+                        "minutes": row.get("duration_minutes"),
+                        "polyline": row.get("encoded_polyline"),
+                    })
+    return charts, {"pins": pins, "circles": circles, "routes": routes}
+
+
+def _with_listing_pins(payload: dict, listings: list[dict], charts: list[dict]) -> dict | None:
+    pins = list(payload["pins"])
+    heat = any(chart.get("type") == "map" for chart in charts)
+    if not heat:
+        seen = {pin.get("listing_id") for pin in pins if pin.get("listing_id")}
+        for card in listings:
+            if card.get("lat") is None or card["listing_id"] in seen:
+                continue
+            pin = _pin(card.get("street") or card.get("building"), card.get("lat"), card.get("lng"), "listing", card["listing_id"])
+            if pin:
+                pins.append(pin)
+                seen.add(card["listing_id"])
+    if not pins and not payload["circles"] and not payload["routes"]:
+        return None
+    payload = dict(payload)
+    payload["pins"] = pins[:25]
+    return payload
+
+
+def resolve_display(
+    question: str,
+    tool_calls: list[dict],
+    answer: str | None = None,
+    profile: dict | None = None,
+    account_id: str | None = None,
+) -> dict:
     """Decide the card layout for one turn and load the listing cards."""
-    groups = []
+    charts, map_payload = _visuals(tool_calls)
+    listings: list[dict] = []
+    display = "none"
     try:
+        groups = []
         for call in tool_calls or []:
             ids = _resolve_refs(_refs_from_call(call))
             if ids:
                 groups.append(ids)
-        if not groups:
-            return {"display": "none", "listings": []}
-        mode = classify(question)
-        unique = []
-        seen = set()
-        for group in groups:
-            for listing_id in group:
-                if listing_id not in seen:
-                    seen.add(listing_id)
-                    unique.append(listing_id)
-        by_id = {card["listing_id"]: card for card in _cards(unique)}
-        named = _mentioned(answer or "", [by_id[listing_id] for listing_id in unique if listing_id in by_id])
-        # A singular question can still be answered with several apartments.
-        # Show a card for each one the reply names.
-        if len(named) >= 2:
-            return {"display": "paired", "listings": named}
-        single = mode == "single" or (mode == "auto" and len(unique) == 1)
-        if single:
-            if named:
-                cards = named[:1]
+        if groups:
+            mode = classify(question)
+            unique = []
+            seen = set()
+            for group in groups:
+                for listing_id in group:
+                    if listing_id not in seen:
+                        seen.add(listing_id)
+                        unique.append(listing_id)
+            by_id = {card["listing_id"]: card for card in _cards(unique, saved=favorite_ids(account_id))}
+            named = _mentioned(answer or "", [by_id[listing_id] for listing_id in unique if listing_id in by_id])
+            # A singular question can still be answered with several apartments.
+            # Show a card for each one the reply names.
+            if len(named) >= 2:
+                display, listings = "paired", named
             else:
-                pick = _choose_single(question, groups, by_id)
-                cards = [by_id[pick]] if pick in by_id else []
-            if not cards:
-                return {"display": "none", "listings": []}
-            return {"display": "single", "listings": cards[:1]}
-        largest = max(groups, key=len)
-        # A later set of the same size is the refined search.
-        for group in groups:
-            if len(group) == len(largest):
-                largest = group
-        cards = [by_id[listing_id] for listing_id in largest if listing_id in by_id]
-        if not cards:
-            return {"display": "none", "listings": []}
-        return {"display": "grid", "listings": cards}
+                single = mode == "single" or (mode == "auto" and len(unique) == 1)
+                if single:
+                    if named:
+                        cards = named[:1]
+                    else:
+                        pick = _choose_single(question, groups, by_id)
+                        cards = [by_id[pick]] if pick in by_id else []
+                    if cards:
+                        display, listings = "single", cards[:1]
+                else:
+                    largest = max(groups, key=len)
+                    # A later set of the same size is the refined search.
+                    for group in groups:
+                        if len(group) == len(largest):
+                            largest = group
+                    cards = [by_id[listing_id] for listing_id in largest if listing_id in by_id]
+                    if cards:
+                        display, listings = "grid", cards
     except (sqlite3.Error, GoogleAPICallError):
-        return {"display": "none", "listings": []}
+        display, listings = "none", []
+    shown = _with_listing_pins(map_payload, listings, charts)
+    suggestions = followups.suggest(question, tool_calls, listings, charts, profile)
+    return {
+        "display": display,
+        "listings": listings,
+        "charts": [chart for chart in charts if chart.get("type") != "map"],
+        "map": shown,
+        "follow_ups": suggestions,
+    }
 
 
 def _text_content(content) -> str:
@@ -574,7 +665,7 @@ def _call_from(item: dict) -> dict:
     }
 
 
-def _turns(items: list[dict]) -> list[dict]:
+def _turns(items: list[dict], account_id: str | None = None, profile: dict | None = None) -> list[dict]:
     turns = []
     current = None
     pending: dict[str, dict] = {}
@@ -585,13 +676,18 @@ def _turns(items: list[dict]) -> list[dict]:
         nonlocal current
         if current is None:
             return
-        presented = resolve_display(current["user"], current["tool_calls"], current["response"])
+        presented = resolve_display(
+            current["user"], current["tool_calls"], current["response"], profile, account_id
+        )
         turns.append({
             "user": current["user"],
             "response": current["response"],
             "tool_calls": current["tool_calls"],
             "display": presented["display"],
             "listings": presented["listings"],
+            "charts": presented["charts"],
+            "map": presented["map"],
+            "follow_ups": presented["follow_ups"],
         })
         current = None
 
@@ -732,7 +828,7 @@ def load_thread(session_id: str, user_id: str) -> dict | None:
     )
     if not found:
         return None
-    turns = _turns(_load_items(session_id, user_id))
+    turns = _turns(_load_items(session_id, user_id), user_id, accounts.get_profile(user_id))
     title = _title_from(next((turn["user"] for turn in turns if turn["user"]), ""))
     return {"session_id": session_id, "title": title, "turns": turns}
 
@@ -741,13 +837,17 @@ def _missing_last(value):
     return (value is None, value)
 
 
-def list_favorites(sort: str) -> dict:
+def list_favorites(account_id: str, sort: str) -> dict:
     chosen = sort if sort in SORTS else "recent"
-    if not _ui_ready() or not _rentals_ready():
+    if not account_id or not _ui_ready() or not _rentals_ready():
         return {"sort": chosen, "listings": []}
     stamps = {
         row["listing_id"]: row["favorited_at"]
-        for row in _rows(_ui, "SELECT listing_id, favorited_at FROM favorites")
+        for row in _rows(
+            _ui,
+            "SELECT listing_id, favorited_at FROM favorites WHERE account_id = ?",
+            (account_id,),
+        )
     }
     if not stamps:
         return {"sort": chosen, "listings": []}
@@ -774,7 +874,9 @@ def list_favorites(sort: str) -> dict:
     return {"sort": chosen, "listings": cards}
 
 
-def add_favorite(listing_id: str) -> dict | None:
+def add_favorite(account_id: str, listing_id: str) -> dict | None:
+    if not account_id:
+        return None
     init_ui()
     cards = _cards([listing_id], saved={listing_id})
     if not cards:
@@ -784,16 +886,17 @@ def add_favorite(listing_id: str) -> dict | None:
     # them here; other instances retry inside the BigQuery call.
     with _ui_lock:
         if bq.prod():
-            bq.upsert_favorite(listing_id, stamp)
+            bq.upsert_favorite(account_id, listing_id, stamp)
         else:
             conn = _ui()
             try:
                 conn.execute(
                     """
-                    INSERT INTO favorites (listing_id, favorited_at) VALUES (?, ?)
-                    ON CONFLICT(listing_id) DO UPDATE SET favorited_at = excluded.favorited_at
+                    INSERT INTO favorites (account_id, listing_id, favorited_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(account_id, listing_id) DO UPDATE SET favorited_at = excluded.favorited_at
                     """,
-                    (listing_id, stamp),
+                    (account_id, listing_id, stamp),
                 )
                 conn.commit()
             finally:
@@ -802,16 +905,21 @@ def add_favorite(listing_id: str) -> dict | None:
     return cards[0]
 
 
-def remove_favorite(listing_id: str) -> bool:
+def remove_favorite(account_id: str, listing_id: str) -> bool:
+    if not account_id:
+        return False
     if bq.prod():
         with _ui_lock:
-            return bq.delete_favorite(listing_id)
+            return bq.delete_favorite(account_id, listing_id)
     if not UI_DB.exists():
         return False
     with _ui_lock:
         conn = _ui()
         try:
-            cursor = conn.execute("DELETE FROM favorites WHERE listing_id = ?", (listing_id,))
+            cursor = conn.execute(
+                "DELETE FROM favorites WHERE account_id = ? AND listing_id = ?",
+                (account_id, listing_id),
+            )
             conn.commit()
             return cursor.rowcount > 0
         finally:

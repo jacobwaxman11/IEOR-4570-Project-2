@@ -1,5 +1,6 @@
 """The tools the harness can run, and the JSON that describes them to the model."""
 
+import asyncio
 import functools
 import json
 import os
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import requests
 from agents import (
+    RunContextWrapper,
     ToolGuardrailFunctionOutput,
     function_tool,
     tool_input_guardrail,
@@ -19,6 +21,9 @@ from agents import (
 )
 from dotenv import load_dotenv
 
+import accounts
+import charts
+from rental_context import as_rental, bind
 from scripts import bq
 
 load_dotenv()
@@ -64,6 +69,7 @@ def _post(service: str, url: str, body: dict, headers: dict) -> object:
     hit = _cache.get(key)
     if hit and time.time() - hit[0] < CACHE_TTL_SECONDS:
         return hit[1]
+    _note_places_call()
     try:
         resp = requests.post(url, json=body, headers=headers, timeout=10)
         resp.raise_for_status()
@@ -81,6 +87,34 @@ def _post(service: str, url: str, body: dict, headers: dict) -> object:
 def _require_google_key() -> None:
     if not GOOGLE_MAPS_API_KEY:
         raise ToolError("GOOGLE_MAPS_API_KEY is not set in .env")
+
+
+def _note_places_call() -> None:
+    rental = as_rental(None)
+    if rental is None:
+        return
+    if rental.places_calls >= 6:
+        raise ToolError("Places and Routes call limit reached for this turn.")
+    rental.places_calls += 1
+
+
+def _cache_account() -> str:
+    rental = as_rental(None)
+    if rental and rental.account_id:
+        return rental.account_id
+    return accounts.SHARED_ACCOUNT
+
+
+def _cached_tool(tool: str, args: dict, ttl: int, fetch, account: str | None = None):
+    owner = account or _cache_account()
+    hit = accounts.cache_get(owner, tool, args)
+    if hit is not None:
+        hit = dict(hit)
+        hit["cached"] = True
+        return hit
+    result = fetch()
+    accounts.cache_put(owner, tool, args, result, ttl)
+    return result
 
 
 def _tool(fn):
@@ -188,6 +222,15 @@ def search_places(query: str, location: str = "New York, NY", limit: int = 5) ->
     if not query:
         raise ToolError("search_places needs a query, e.g. 'museums' or 'ramen'")
     limit = _clamp_int(limit, 5, 1, 5)
+    cache_key = {"query": query, "location": location, "limit": limit}
+
+    def fetch() -> dict:
+        return _search_places_live(query, location, limit)
+
+    return _cached_tool("search_places", cache_key, accounts.PLACES_TTL_SECONDS, fetch)
+
+
+def _search_places_live(query: str, location: str, limit: int) -> dict:
     _require_google_key()
     body = _post("Google Places", PLACES_URL, {
         "textQuery": f"{query} in {location}",
@@ -255,6 +298,15 @@ def get_directions(origin: str, destination: str, mode: str = "transit") -> dict
     mode_key = _clean(mode).lower() or "transit"
     if mode_key not in TRAVEL_MODES:
         raise ToolError(f"Unknown mode '{mode}'. Use one of: {', '.join(TRAVEL_MODES)}.")
+    cache_key = {"origin": origin, "destination": destination, "mode": mode_key}
+
+    def fetch() -> dict:
+        return _directions_live(origin, destination, mode_key)
+
+    return _cached_tool("get_directions", cache_key, accounts.PLACES_TTL_SECONDS, fetch)
+
+
+def _directions_live(origin: str, destination: str, mode_key: str) -> dict:
     _require_google_key()
     body = _post("Google Routes", ROUTES_URL, {
         "origin": {"address": origin},
@@ -263,7 +315,7 @@ def get_directions(origin: str, destination: str, mode: str = "transit") -> dict
         "languageCode": "en-US",
         "units": "IMPERIAL",
     }, _google_headers(
-        "routes.duration,routes.distanceMeters,routes.legs.steps.staticDuration,"
+        "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.steps.staticDuration,"
         "routes.legs.steps.travelMode,routes.legs.steps.navigationInstruction.instructions,"
         "routes.legs.steps.transitDetails.transitLine,routes.legs.steps.transitDetails.headsign"
     ))
@@ -281,6 +333,7 @@ def get_directions(origin: str, destination: str, mode: str = "transit") -> dict
         "mode": mode_key,
         "distance_miles": _miles(route.get("distanceMeters")),
         "duration_minutes": _minutes(_seconds(route.get("duration"))),
+        "encoded_polyline": (route.get("polyline") or {}).get("encodedPolyline"),
         "steps": steps[:10],
     }
     if hidden:
@@ -798,6 +851,14 @@ def _run_sql(query: str) -> str:
             "These rows are the search result. Do not call run_sql again. "
             "A location question calls search_places for the listings you are answering about."
         )
+    else:
+        rental = as_rental(None)
+        question = rental.user_message if rental else ""
+        chart = charts.infer_chart(payload["columns"], payload["rows"], question)
+        if chart is not None:
+            if chart["type"] == "map":
+                _fill_map_coords(chart)
+            payload["chart"] = chart
     return json.dumps(payload, default=str)
 
 
@@ -807,14 +868,39 @@ _SEARCH_DONE = "_sql_search_done"
 
 
 def _mark_search_done(ctx) -> None:
+    rental = as_rental(ctx)
+    if rental is not None:
+        rental.sql_search_done = True
+        return
     usage = getattr(ctx, "usage", None)
     if usage is not None:
         object.__setattr__(usage, _SEARCH_DONE, True)
 
 
 def _search_is_done(ctx) -> bool:
+    rental = as_rental(ctx)
+    if rental is not None:
+        return rental.sql_search_done
     usage = getattr(ctx, "usage", None)
     return bool(usage is not None and getattr(usage, _SEARCH_DONE, False))
+
+
+@tool_input_guardrail
+def bind_rental(data) -> ToolGuardrailFunctionOutput:
+    """Publish this run's context for Places cache and the call cap."""
+    bind(data.context)
+    return ToolGuardrailFunctionOutput.allow()
+
+
+@tool_input_guardrail
+def places_budget(data) -> ToolGuardrailFunctionOutput:
+    """Stop a turn that has already spent its Places and Routes calls."""
+    rental = as_rental(data.context)
+    if rental is not None and rental.places_calls >= 6:
+        return ToolGuardrailFunctionOutput.reject_content(
+            "Places and Routes call limit reached for this turn. Answer from the calls already made."
+        )
+    return ToolGuardrailFunctionOutput.allow()
 
 
 @tool_input_guardrail
@@ -882,7 +968,7 @@ def read_only_sql(data) -> ToolGuardrailFunctionOutput:
 
 
 @function_tool(
-    tool_input_guardrails=[read_only_sql, finished_search],
+    tool_input_guardrails=[bind_rental, read_only_sql, finished_search],
     tool_output_guardrails=[remember_search],
 )
 def run_sql(query: str) -> str:
@@ -1422,7 +1508,13 @@ def compare_neighborhoods(neighborhoods: str) -> dict:
 
     priced = [row for row in summaries if row["median_rent"] is not None]
     lowest = min(priced, key=lambda row: row["median_rent"])["neighborhood"] if priced else None
-    return {"neighborhoods": summaries, "lowest_median_rent": lowest}
+    points = [
+        charts._point(row["neighborhood"], row["avg_rent"])
+        for row in summaries
+        if row.get("avg_rent") is not None
+    ]
+    chart = charts.bar_chart("Average rent by neighborhood", points, unit="usd")
+    return {"neighborhoods": summaries, "lowest_median_rent": lowest, "chart": chart}
 
 
 @_tool
@@ -1456,12 +1548,410 @@ def summarize_neighborhood(neighborhood: str) -> dict:
         """,
         (name,),
     )
-    return {"neighborhood": name, **_price_stats(rows), "bed_mix": bed_mix, "top_amenities": amenities}
+    mix_points = [
+        charts._point(charts.unit_label(row["beds"]), row["listings"])
+        for row in bed_mix
+    ]
+    chart = charts.bar_chart(f"Listings by apartment type in {name}", mix_points, unit="count")
+    return {
+        "neighborhood": name,
+        **_price_stats(rows),
+        "bed_mix": bed_mix,
+        "top_amenities": amenities,
+        "chart": chart,
+    }
 
 
-def _agent_tool(fn):
-    """Expose a crypto-style tool to the Agents SDK without hiding its __wrapped__ function."""
-    return function_tool(fn, strict_mode=False)
+def _fill_map_coords(chart: dict) -> None:
+    missing = [point for point in chart.get("points") or [] if "lat" not in point]
+    if not missing:
+        return
+    rows = _query_rows(
+        """
+        SELECT neighborhood, AVG(lat) AS lat, AVG(lng) AS lng
+        FROM listings
+        WHERE lat IS NOT NULL AND lng IS NOT NULL AND neighborhood IS NOT NULL
+        GROUP BY neighborhood
+        """
+    )
+    by_name = {row["neighborhood"]: row for row in rows}
+    for point in chart.get("points") or []:
+        found = by_name.get(point["label"])
+        if found and found.get("lat") is not None and found.get("lng") is not None:
+            point["lat"] = round(float(found["lat"]), 5)
+            point["lng"] = round(float(found["lng"]), 5)
+
+
+def _active_where(neighborhood: str | None) -> tuple[str, list]:
+    clauses = ["listing_status = 'ACTIVE'", "rent IS NOT NULL"]
+    params: list = []
+    if neighborhood:
+        resolved = _resolve_areas(neighborhood) or [_resolve_neighborhood(neighborhood)]
+        marks = ", ".join("?" for _ in resolved)
+        clauses.append(f"neighborhood IN ({marks})")
+        params.extend(resolved)
+    return " AND ".join(clauses), params
+
+
+_UNIT_SQL = """
+CASE
+    WHEN beds IS NULL THEN 'Unknown'
+    WHEN beds < 1 THEN 'Studio'
+    WHEN beds < 2 THEN '1-bedroom'
+    WHEN beds < 3 THEN '2-bedroom'
+    ELSE '3+ bedrooms'
+END
+"""
+
+
+@_tool
+def average_rent_by_neighborhood() -> dict:
+    """Average listed rent for active listings in each neighborhood, with a bar chart.
+
+    Use this when the user asks for average rent by neighborhood.
+    """
+    def fetch() -> dict:
+        rows = _query_rows(
+            """
+            SELECT neighborhood, ROUND(AVG(rent)) AS avg_rent, COUNT(*) AS listings,
+                   AVG(lat) AS lat, AVG(lng) AS lng
+            FROM listings
+            WHERE listing_status = 'ACTIVE' AND rent IS NOT NULL AND neighborhood IS NOT NULL
+            GROUP BY neighborhood
+            ORDER BY avg_rent
+            """
+        )
+        points = [
+            charts._point(row["neighborhood"], row["avg_rent"], row.get("lat"), row.get("lng"))
+            for row in rows
+        ]
+        chart = charts.bar_chart("Average rent by neighborhood", points, unit="usd")
+        return {"count": len(rows), "neighborhoods": rows, "chart": chart}
+
+    return _cached_tool(
+        "average_rent_by_neighborhood", {}, accounts.CHART_TTL_SECONDS, fetch, accounts.SHARED_ACCOUNT
+    )
+
+
+@_tool
+def average_rent_by_unit_type(neighborhood: str | None = None) -> dict:
+    """Average listed rent by apartment type: studio, 1-bedroom, 2-bedroom, and 3+.
+
+    Args:
+        neighborhood: Optional neighborhood or area name, such as 'Chelsea' or 'UWS'.
+    """
+    where, params = _active_where(neighborhood)
+    cache_key = {"neighborhood": neighborhood or ""}
+
+    def fetch() -> dict:
+        rows = _query_rows(
+            f"""
+            SELECT {_UNIT_SQL} AS unit_type,
+                   ROUND(AVG(rent)) AS avg_rent,
+                   COUNT(*) AS listings
+            FROM listings
+            WHERE {where}
+            GROUP BY unit_type
+            ORDER BY MIN(beds)
+            """,
+            tuple(params),
+        )
+        points = [charts._point(row["unit_type"], row["avg_rent"]) for row in rows]
+        title = "Average rent by apartment type"
+        if neighborhood:
+            title += f" in {neighborhood}"
+        chart = charts.bar_chart(title, points, unit="usd")
+        return {"neighborhood": neighborhood, "unit_types": rows, "chart": chart}
+
+    return _cached_tool(
+        "average_rent_by_unit_type", cache_key, accounts.CHART_TTL_SECONDS, fetch, accounts.SHARED_ACCOUNT
+    )
+
+
+@_tool
+def listing_mix(by: str = "neighborhood", neighborhood: str | None = None) -> dict:
+    """Share of active listings as a pie chart, by neighborhood or by apartment type.
+
+    Args:
+        by: 'neighborhood' or 'unit_type'. Defaults to neighborhood.
+        neighborhood: Optional neighborhood filter when by is 'unit_type'.
+    """
+    kind = _clean(by).lower().replace(" ", "_") or "neighborhood"
+    if kind in {"apartment_type", "beds", "unit", "bedrooms"}:
+        kind = "unit_type"
+    if kind not in {"neighborhood", "unit_type"}:
+        raise ToolError("listing_mix by must be 'neighborhood' or 'unit_type'.")
+    where, params = _active_where(neighborhood if kind == "unit_type" else None)
+    label = _UNIT_SQL if kind == "unit_type" else "neighborhood"
+    cache_key = {"by": kind, "neighborhood": neighborhood or ""}
+
+    def fetch() -> dict:
+        rows = _query_rows(
+            f"""
+            SELECT {label} AS label, COUNT(*) AS listings
+            FROM listings
+            WHERE {where} AND {label} IS NOT NULL
+            GROUP BY label
+            ORDER BY listings DESC
+            """,
+            tuple(params),
+        )
+        points = [charts._point(row["label"], row["listings"]) for row in rows]
+        title = "Listings by neighborhood" if kind == "neighborhood" else "Listings by apartment type"
+        if neighborhood and kind == "unit_type":
+            title = f"Listings by apartment type in {neighborhood}"
+        chart = charts.pie_chart(title, points)
+        return {"by": kind, "rows": rows, "chart": chart}
+
+    return _cached_tool(
+        "listing_mix", cache_key, accounts.CHART_TTL_SECONDS, fetch, accounts.SHARED_ACCOUNT
+    )
+
+
+@_tool
+def neighborhood_price_map() -> dict:
+    """Neighborhood map colored by average rent. Each point is one neighborhood."""
+    def fetch() -> dict:
+        rows = _query_rows(
+            """
+            SELECT neighborhood, ROUND(AVG(rent)) AS avg_rent, COUNT(*) AS listings,
+                   AVG(lat) AS lat, AVG(lng) AS lng
+            FROM listings
+            WHERE listing_status = 'ACTIVE' AND rent IS NOT NULL AND neighborhood IS NOT NULL
+              AND lat IS NOT NULL AND lng IS NOT NULL
+            GROUP BY neighborhood
+            ORDER BY avg_rent
+            """
+        )
+        points = [
+            charts._point(row["neighborhood"], row["avg_rent"], row.get("lat"), row.get("lng"))
+            for row in rows
+        ]
+        chart = charts.map_chart("Average rent by neighborhood", points)
+        return {"neighborhoods": rows, "chart": chart}
+
+    return _cached_tool(
+        "neighborhood_price_map", {}, accounts.CHART_TTL_SECONDS, fetch, accounts.SHARED_ACCOUNT
+    )
+
+
+def _listing_place(listing_id: str) -> dict:
+    rows = _query_rows(
+        """
+        SELECT listing_id, name, street, unit, neighborhood, lat, lng
+        FROM listings
+        WHERE listing_id = ?
+        """,
+        (listing_id,),
+    )
+    if not rows:
+        raise ToolError(f"No listing '{listing_id}'.")
+    row = rows[0]
+    if row.get("lat") is None or row.get("lng") is None:
+        street = _clean(row.get("street") or row.get("name"))
+        neighborhood = _clean(row.get("neighborhood") or "New York, NY")
+        if street:
+            found = search_places.__wrapped__(street, neighborhood, 1)
+            if isinstance(found, str):
+                found = json.loads(found)
+            places = (found or {}).get("places") or []
+            if places and places[0].get("lat") is not None:
+                row["lat"] = places[0]["lat"]
+                row["lng"] = places[0]["lng"]
+                row["geocoded"] = True
+    return row
+
+
+@_tool
+def show_listing_map(listing_id: str) -> dict:
+    """Return the map pin for one listing. Uses stored coordinates, or geocodes the street once.
+
+    Args:
+        listing_id: The listing_id from a previous search or deal result.
+    """
+    row = _listing_place(_clean(listing_id))
+    if row.get("lat") is None or row.get("lng") is None:
+        raise ToolError(f"No coordinates for listing '{listing_id}'.")
+    return {
+        "listing_id": row["listing_id"],
+        "building": row.get("name"),
+        "street": row.get("street"),
+        "unit": row.get("unit"),
+        "neighborhood": row.get("neighborhood"),
+        "lat": row.get("lat"),
+        "lng": row.get("lng"),
+        "geocoded": bool(row.get("geocoded")),
+    }
+
+
+@_tool
+def neighborhood_activities(neighborhood: str) -> dict:
+    """Places to go in a neighborhood: parks, restaurants, and museums.
+
+    Args:
+        neighborhood: Neighborhood name, such as 'Chelsea' or 'Hell's Kitchen'.
+    """
+    try:
+        name = _resolve_neighborhood(neighborhood)
+    except ToolError:
+        resolved = _resolve_areas(neighborhood)
+        name = resolved[0] if resolved else _clean(neighborhood)
+    found = search_places.__wrapped__(f"things to do in {name}", f"{name}, New York, NY", 5)
+    if isinstance(found, str):
+        found = json.loads(found)
+    if isinstance(found, dict) and found.get("error"):
+        raise ToolError(found["error"])
+    return {"neighborhood": name, "places": (found or {}).get("places") or []}
+
+
+def _commute_one(rental, listing_id: str, destination: str, mode: str) -> dict:
+    from rental_context import CURRENT
+
+    token = CURRENT.set(rental)
+    try:
+        row = _listing_place(listing_id)
+        origin = ", ".join(
+            part for part in (row.get("street"), row.get("neighborhood"), "New York, NY") if part
+        )
+        route = get_directions.__wrapped__(origin, destination, mode)
+        return {
+            "listing_id": row["listing_id"],
+            "building": row.get("name"),
+            "street": row.get("street"),
+            "neighborhood": row.get("neighborhood"),
+            "lat": row.get("lat"),
+            "lng": row.get("lng"),
+            "origin": origin,
+            "destination": route.get("destination"),
+            "mode": route.get("mode"),
+            "duration_minutes": route.get("duration_minutes"),
+            "distance_miles": route.get("distance_miles"),
+            "encoded_polyline": route.get("encoded_polyline"),
+        }
+    except ToolError as exc:
+        return {"listing_id": listing_id, "error": str(exc)}
+    finally:
+        CURRENT.reset(token)
+
+
+def _split_ids(value) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        parts = str(value or "").replace(";", ",").split(",")
+    ids = []
+    for part in parts:
+        cleaned = _clean(part)
+        if cleaned and cleaned not in ids:
+            ids.append(cleaned)
+    return ids[:4]
+
+
+async def commute_from_listing(
+    ctx: RunContextWrapper,
+    listing_ids: str,
+    destination: str = "",
+    mode: str = "",
+) -> str:
+    """Travel time from one or more listings to an address. Say 'work' to use the saved work address.
+
+    Up to four listings are routed in parallel.
+
+    Args:
+        listing_ids: One listing_id, or several separated by commas.
+        destination: Street or place. Use 'work' for the profile work address. Optional when the profile has one.
+        mode: transit, walk, drive, or bicycle. Optional. Defaults to the profile, then transit.
+    """
+    rental = as_rental(ctx)
+    bind(ctx)
+    profile = rental.profile if rental else {}
+    dest = _clean(destination)
+    if not dest or dest.casefold() in {"work", "my work", "the office"}:
+        dest = _clean(profile.get("work_address"))
+    if not dest:
+        return json.dumps({"error": "A destination or a saved work address is required."})
+    travel = _clean(mode).lower() or _clean(profile.get("commute_mode")).lower() or "transit"
+    ids = _split_ids(listing_ids)
+    if not ids:
+        return json.dumps({"error": "commute_from_listing needs at least one listing_id."})
+    rows = await asyncio.gather(
+        *[asyncio.to_thread(_commute_one, rental, listing_id, dest, travel) for listing_id in ids]
+    )
+    ok = next((row for row in rows if row.get("duration_minutes") is not None), None)
+    if ok and rental and rental.account_id:
+        summary = (
+            f"{ok.get('street') or ok['listing_id']} to {dest}: "
+            f"{ok['duration_minutes']} min by {ok.get('mode') or travel}"
+        )
+        accounts.set_last_commute(rental.account_id, summary)
+        rental.profile = accounts.get_profile(rental.account_id)
+    return json.dumps({
+        "destination": dest,
+        "mode": travel,
+        "listings": list(rows),
+    }, default=str)
+
+
+@function_tool(needs_approval=True, strict_mode=False, tool_input_guardrails=[bind_rental])
+def save_profile(
+    ctx: RunContextWrapper,
+    max_rent: float | None = None,
+    min_beds: float | None = None,
+    neighborhoods: str | None = None,
+    work_address: str | None = None,
+    commute_mode: str | None = None,
+) -> str:
+    """Save budget, size, neighborhoods, or work address on the signed-in account.
+
+    Call this when the user states a budget, a bedroom count, neighborhoods they want,
+    or where they work. The user must approve the change before it is stored.
+
+    Args:
+        max_rent: Monthly budget ceiling in dollars. Omit to leave it unchanged.
+        min_beds: Minimum bedrooms. Use 0 for a studio. Omit to leave it unchanged.
+        neighborhoods: Comma-separated neighborhood names. Omit to leave them unchanged.
+        work_address: Street or place they commute to. Omit to leave it unchanged.
+        commute_mode: transit, walk, drive, or bicycle. Omit to leave it unchanged.
+    """
+    rental = as_rental(ctx)
+    if rental is None or not rental.account_id:
+        return json.dumps({"error": "Sign in before saving a profile."})
+    fields: dict = {}
+    if max_rent is not None:
+        fields["max_rent"] = max_rent
+    if min_beds is not None:
+        fields["min_beds"] = min_beds
+    if neighborhoods is not None:
+        fields["neighborhoods"] = [part.strip() for part in str(neighborhoods).split(",") if part.strip()]
+    if work_address is not None:
+        fields["work_address"] = _clean(work_address)
+    if commute_mode is not None:
+        mode = _clean(commute_mode).lower()
+        if mode and mode not in TRAVEL_MODES:
+            return json.dumps({"error": f"Unknown commute mode '{commute_mode}'."})
+        fields["commute_mode"] = mode or "transit"
+    profile = accounts.save_profile(rental.account_id, fields)
+    rental.profile = profile
+    return json.dumps({"saved": True, "profile": profile})
+
+
+def _commute_enabled(ctx, agent) -> bool:
+    rental = as_rental(ctx)
+    message = (rental.user_message if rental else "").casefold()
+    profile = rental.profile if rental else {}
+    words = (
+        "commute", "directions", "how long", "how far", "travel time",
+        "route", "to work", "from this", "from the",
+    )
+    if any(word in message for word in words):
+        return True
+    return bool(profile.get("work_address") and "work" in message)
+
+
+def _agent_tool(fn, **kwargs):
+    """Expose a tool to the Agents SDK without hiding its __wrapped__ function."""
+    guards = [bind_rental, *list(kwargs.pop("tool_input_guardrails", []) or [])]
+    return function_tool(fn, strict_mode=False, tool_input_guardrails=guards, **kwargs)
 
 
 ANALYSIS_TOOLS = [
@@ -1472,8 +1962,25 @@ ANALYSIS_TOOLS = [
     _agent_tool(best_deals_in_neighborhood),
     _agent_tool(compare_neighborhoods),
     _agent_tool(summarize_neighborhood),
+    _agent_tool(average_rent_by_neighborhood),
+    _agent_tool(average_rent_by_unit_type),
+    _agent_tool(listing_mix),
+    _agent_tool(neighborhood_price_map),
+    save_profile,
 ]
 
 PLACES_TOOLS = [
-    _agent_tool(search_places),
+    _agent_tool(search_places, tool_input_guardrails=[places_budget]),
+    _agent_tool(
+        get_directions,
+        is_enabled=_commute_enabled,
+        tool_input_guardrails=[places_budget],
+    ),
+    _agent_tool(show_listing_map, tool_input_guardrails=[places_budget]),
+    _agent_tool(neighborhood_activities, tool_input_guardrails=[places_budget]),
+    function_tool(
+        commute_from_listing,
+        strict_mode=False,
+        tool_input_guardrails=[bind_rental, places_budget],
+    ),
 ]

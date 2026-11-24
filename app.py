@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 
@@ -15,8 +16,9 @@ from agents import (
 )
 from agents.extensions.models.litellm_model import LitellmModel
 from agents.run_config import ModelInputData, RunConfig
+from agents.run_state import RunState
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -32,6 +34,9 @@ from present import (
     remove_favorite,
     resolve_display,
 )
+import accounts
+import observe
+from rental_context import CURRENT, RentalContext, from_dict, to_dict
 from scripts import bq
 from session_store import claim_session, open_session, owns_session
 from tools import (
@@ -127,6 +132,18 @@ WHERE listing_status = 'ACTIVE'
   AND rent IS NOT NULL
 GROUP BY neighborhood
 ORDER BY avg_rent;
+
+Profile, charts, and places:
+- When the user states a budget, a bedroom minimum, neighborhoods, or a work address, call save_profile. It does not save until the user approves.
+- "My budget" and "to work" use the renter profile when one is present.
+- Average rent by neighborhood: average_rent_by_neighborhood.
+- Average rent by apartment type (studio, 1-bedroom, 2-bedroom, 3+): average_rent_by_unit_type.
+- Share of listings by neighborhood or by apartment type: listing_mix.
+- A neighborhood price map: neighborhood_price_map.
+- Commute time from listings already in hand to an address or to work: commute_from_listing.
+- Things to do in a neighborhood: neighborhood_activities.
+- Show one unit on a map: show_listing_map.
+- get_directions is only for two addresses when you do not have a listing id.
 """
 
 if bq.prod():
@@ -178,6 +195,19 @@ def _with_catalog(instructions: str, catalog: str) -> str:
     )
 
 
+def _instructions(ctx, _agent) -> str:
+    """Catalog plus the signed-in profile. Both are already loaded, so the model does not fetch them."""
+    text = _with_catalog(_INSTRUCTIONS, load_mappings())
+    rental = getattr(ctx, "context", None)
+    block = accounts.profile_text(getattr(rental, "profile", None))
+    if block:
+        text += "\n\n" + block
+    return text
+
+
+agent.instructions = _instructions
+
+
 def _prefetch_items(catalog: str) -> list[dict]:
     return [
         {
@@ -214,14 +244,53 @@ def _has_prefetch(items) -> bool:
     return any(_call_id(item) == PREFETCH_MAPPINGS_CALL_ID for item in items)
 
 
-def _drop_prefetch_mappings(data):
-    """Keep the prefetched column read in the transcript, and out of the model request.
+def _short_tool(name: str, output: str) -> str:
+    try:
+        parsed = json.loads(output) if output else None
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("rows"), list):
+        return f"{name}: {len(parsed['rows'])} rows"
+    if isinstance(parsed, dict) and isinstance(parsed.get("listings"), list):
+        return f"{name}: {len(parsed['listings'])} listings"
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return f"{name}: error"
+    return f"{name}: done"
 
-    It is stored before the user message. Gemini rejects a tool call in that position.
-    The catalog is already in the instructions.
+
+def _trim_old_tools(items: list) -> list:
+    """Keep the last two user turns intact and shorten older tool payloads."""
+    user_at = []
+    for index, item in enumerate(items):
+        role = item.get("role") if isinstance(item, dict) else getattr(item, "role", None)
+        if role == "user":
+            user_at.append(index)
+    if len(user_at) < 3:
+        return items
+    cutoff = user_at[-2]
+    names = {}
+    for item in items[:cutoff]:
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            names[item.get("call_id")] = item.get("name") or "tool"
+    trimmed = []
+    for index, item in enumerate(items):
+        if index >= cutoff or not isinstance(item, dict) or item.get("type") != "function_call_output":
+            trimmed.append(item)
+            continue
+        copy = dict(item)
+        copy["output"] = _short_tool(names.get(item.get("call_id"), "tool"), item.get("output") or "")
+        trimmed.append(copy)
+    return trimmed
+
+
+def _prepare_model_input(data):
+    """Drop the prefetched catalog read and shorten tool output from older turns.
+
+    The catalog read is stored before the user message. Gemini rejects a tool call
+    in that position. The catalog is already in the instructions.
     """
     kept = [item for item in data.model_data.input if _call_id(item) != PREFETCH_MAPPINGS_CALL_ID]
-    return ModelInputData(input=kept, instructions=data.model_data.instructions)
+    return ModelInputData(input=_trim_old_tools(kept), instructions=data.model_data.instructions)
 
 
 class RecordToolCalls(RunHooks):
@@ -234,12 +303,14 @@ class RecordToolCalls(RunHooks):
     `mappings` when this turn should show that prefetched read.
     """
 
-    def __init__(self, mappings: str | None = None):
+    def __init__(self, mappings: str | None = None, trace: observe.TurnTrace | None = None):
         self.tool_calls = []
         self.events = asyncio.Queue()
         self.prefetch_result = mappings
+        self.trace = trace
         self._seq = 0
         self._indexes = {}
+        self._started: dict[int, float] = {}
         self._held = []
         self._mappings_visible = False
         self._mappings_closed = False
@@ -301,6 +372,7 @@ class RecordToolCalls(RunHooks):
             self._seq += 1
             index = self._seq
             self._indexes[id(context)] = index
+            self._started[index] = time.monotonic()
             event = {
                 "type": "tool_start",
                 "index": index,
@@ -321,9 +393,14 @@ class RecordToolCalls(RunHooks):
             args = _tool_args(context)
             # For a function tool, context is a ToolContext: it carries the call's arguments.
             self._remember(tool.name, args, str(result))
+            index = self._indexes.pop(id(context), self._seq)
+            started = self._started.pop(index, None)
+            if self.trace is not None:
+                seconds = time.monotonic() - started if started is not None else 0
+                self.trace.tool(tool.name, args, str(result), seconds)
             event = {
                 "type": "tool_end",
-                "index": self._indexes.pop(id(context), self._seq),
+                "index": index,
                 "name": tool.name,
                 "args": args,
                 "result": str(result),
@@ -352,19 +429,25 @@ init_ui()
 
 app = FastAPI()
 
-# One browser, one history. The id is random and stays in an HttpOnly cookie,
-# so a request cannot ask for someone else's chats by passing a user id.
+# The cookie is the Google account id. Chats, favorites, and the profile hang off it.
 USER_COOKIE = "chat_user"
-_USER_ID = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
+_ACCOUNT_ID = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 
 
-def _user_from(request: Request) -> tuple[str, bool]:
+def _account_id(request: Request) -> str | None:
     current = request.cookies.get(USER_COOKIE, "")
-    if _USER_ID.fullmatch(current):
-        return current, False
-    return str(uuid.uuid4()), True
+    if not _ACCOUNT_ID.fullmatch(current):
+        return None
+    if accounts.get_account(current) is None:
+        return None
+    return current
+
+
+def _require_account(request: Request) -> str:
+    account_id = _account_id(request)
+    if not account_id:
+        raise HTTPException(status_code=401, detail="Sign in required")
+    return account_id
 
 
 def _set_user_cookie(response: Response, request: Request, user_id: str) -> None:
@@ -381,17 +464,14 @@ def _set_user_cookie(response: Response, request: Request, user_id: str) -> None
     )
 
 
-def _bind_user(request: Request, response: Response) -> str:
-    """Read the browser's user id, and set the cookie when this browser is new."""
-    user_id, minted = _user_from(request)
-    if minted:
-        _set_user_cookie(response, request, user_id)
-    return user_id
-
-
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
+
+
+class ResumeRequest(BaseModel):
+    session_id: str
+    approved: bool
 
 
 class PreviewRequest(BaseModel):
@@ -402,90 +482,26 @@ class FavoriteRequest(BaseModel):
     listing_id: str
 
 
-@app.get("/")
-def index(request: Request):
-    # The empty chat is on screen before anyone sends. Load the columns then.
-    # The cookie is set on this response, before the page asks for /threads.
-    start_read_mappings()
-    user_id, minted = _user_from(request)
-    response = FileResponse(
-        Path(__file__).parent / "index.html",
-        headers={"Cache-Control": "no-cache"},
-    )
-    if minted:
-        _set_user_cookie(response, request, user_id)
-    return response
+class GoogleRequest(BaseModel):
+    credential: str
 
 
-@app.post("/mappings/warm")
-def warm_mappings():
-    """Start read_mappings. Returns before the read finishes. The page shows nothing."""
-    start_read_mappings()
-    return {"status": "ok"}
+def _approval_arguments(item) -> dict:
+    raw = getattr(item, "raw_item", None)
+    if isinstance(raw, dict):
+        args = raw.get("arguments") or "{}"
+    else:
+        args = getattr(raw, "arguments", None) or "{}"
+    if isinstance(args, dict):
+        return args
+    try:
+        parsed = json.loads(args)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
-async def _arm_mappings(session, hooks) -> Agent:
-    """Use a column catalog that was loaded before this message, when the thread has none."""
-    prior = await session.get_items()
-    if _has_real_mappings(prior):
-        return agent
-    catalog = await asyncio.to_thread(load_mappings)
-    if not _has_prefetch(prior):
-        await session.add_items(_prefetch_items(catalog))
-        hooks.prefetch_result = catalog
-    return agent.clone(instructions=_with_catalog(agent.instructions, catalog))
-
-
-@app.post("/chat")
-async def chat(body: ChatRequest, http_request: Request):
-    # A new id is stored for this browser. An id this browser does not own is refused
-    # before the model runs, so the reply cannot be written into someone else's chat.
-    # Events stream as the tools run, so the page can show each step before the answer exists.
-    # The column read may already be running from the empty chat. Join it here, and
-    # show that step only once the other tool calls are on screen.
-    user_id, minted = _user_from(http_request)
-    session_id = body.session_id or str(uuid.uuid4())
-    allowed = await asyncio.to_thread(claim_session, session_id, user_id)
-    if not allowed:
-        raise HTTPException(status_code=404, detail="No chat with that id")
-    start_read_mappings()
-    session = open_session(session_id)
-    hooks = RecordToolCalls()
-    run_config = RunConfig(call_model_input_filter=_drop_prefetch_mappings)
-
-    async def run():
-        try:
-            run_agent = await _arm_mappings(session, hooks)
-            result = await Runner.run(
-                run_agent,
-                body.message,
-                session=session,
-                hooks=hooks,
-                max_turns=25,
-                run_config=run_config,
-            )
-            response = result.final_output
-        except Exception as e:
-            # Auth, billing, a model that is not running: show it in the chat, not as a 500.
-            # Keep the calls that already finished so the page can still show those steps.
-            response = f"Model call failed: {type(e).__name__}: {str(e)[:300]}"
-        await hooks.release()
-        tool_calls = hooks.tool_calls
-        # Card lookup hits SQLite or BigQuery. Keep it off the event loop so the
-        # page can keep painting tool steps and the sidebar stays clickable.
-        presented = await asyncio.to_thread(
-            resolve_display, body.message, tool_calls, response
-        )
-        await hooks.events.put({
-            "type": "done",
-            "response": response,
-            "session_id": session_id,
-            "tool_calls": tool_calls,
-            "display": presented["display"],
-            "listings": presented["listings"],
-        })
-        await hooks.events.put(None)
-
+def _event_stream(hooks: RecordToolCalls, run) -> StreamingResponse:
     task = asyncio.create_task(run())
 
     async def generate():
@@ -499,60 +515,267 @@ async def chat(body: ChatRequest, http_request: Request):
             if not task.done():
                 task.cancel()
 
-    stream = StreamingResponse(
+    return StreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-    if minted:
-        _set_user_cookie(stream, http_request, user_id)
-    return stream
+
+
+async def _emit_done(hooks, trace, question, response, session_id, account_id, profile) -> None:
+    await hooks.release()
+    if trace is not None:
+        trace.finish(response or "")
+    presented = await asyncio.to_thread(
+        resolve_display, question, hooks.tool_calls, response, profile, account_id
+    )
+    await hooks.events.put({
+        "type": "done",
+        "response": response,
+        "session_id": session_id,
+        "tool_calls": hooks.tool_calls,
+        "display": presented["display"],
+        "listings": presented["listings"],
+        "charts": presented["charts"],
+        "map": presented["map"],
+        "follow_ups": presented["follow_ups"],
+        "trace_id": None if trace is None else trace.trace_id,
+    })
+    await hooks.events.put(None)
+
+
+@app.get("/")
+def index():
+    # The empty page can load the column catalog before anyone is signed in.
+    start_read_mappings()
+    return FileResponse(
+        Path(__file__).parent / "index.html",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/auth/config")
+def auth_config():
+    return {
+        "client_id": accounts.google_client_id(),
+        "maps_api_key": os.environ.get("GOOGLE_MAPS_API_KEY", ""),
+    }
+
+
+@app.get("/auth/me")
+def auth_me(http_request: Request):
+    account_id = _require_account(http_request)
+    account = accounts.get_account(account_id) or {"account_id": account_id}
+    return {**account, "profile": accounts.get_profile(account_id)}
+
+
+@app.post("/auth/google")
+def auth_google(body: GoogleRequest, http_request: Request):
+    try:
+        info = accounts.verify_google_token(body.credential)
+    except accounts.AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    account = accounts.upsert_account(str(info["sub"]), info.get("email"), info.get("name"))
+    response = JSONResponse(account)
+    _set_user_cookie(response, http_request, account["account_id"])
+    return response
+
+
+@app.post("/auth/logout")
+def auth_logout(response: Response):
+    response.delete_cookie(USER_COOKIE, path="/")
+    return {"status": "ok"}
+
+
+@app.post("/mappings/warm")
+def warm_mappings():
+    """Start read_mappings. Returns before the read finishes. The page shows nothing."""
+    start_read_mappings()
+    return {"status": "ok"}
+
+
+async def _arm_mappings(session, hooks) -> None:
+    """Store the column catalog on a new thread so the page can show that step."""
+    prior = await session.get_items()
+    if _has_real_mappings(prior):
+        return
+    catalog = await asyncio.to_thread(load_mappings)
+    if not _has_prefetch(prior):
+        await session.add_items(_prefetch_items(catalog))
+        hooks.prefetch_result = catalog
+
+
+def _open_turn(account_id: str, session_id: str, message: str) -> tuple[RentalContext, observe.TurnTrace]:
+    profile = accounts.get_profile(account_id)
+    ctx = RentalContext(account_id=account_id, profile=profile, user_message=message)
+    CURRENT.set(ctx)
+    trace = observe.start_trace(account_id, session_id, message)
+    ctx.trace_id = trace.trace_id
+    return ctx, trace
+
+
+async def _pause_for_approval(result, hooks, trace, session_id, account_id) -> bool:
+    interruptions = getattr(result, "interruptions", None) or []
+    if not interruptions:
+        return False
+    state = result.to_state()
+    await asyncio.to_thread(
+        accounts.save_pending,
+        session_id,
+        account_id,
+        state.to_json(context_serializer=to_dict),
+    )
+    item = interruptions[0]
+    await hooks.events.put({
+        "type": "approval",
+        "session_id": session_id,
+        "tool": item.tool_name or "save_profile",
+        "arguments": _approval_arguments(item),
+    })
+    if trace is not None:
+        trace.finish("Waiting for profile approval")
+    await hooks.events.put(None)
+    return True
+
+
+@app.post("/chat")
+async def chat(body: ChatRequest, http_request: Request):
+    # Events stream as the tools run, so the page can show each step before the answer exists.
+    account_id = _require_account(http_request)
+    session_id = body.session_id or str(uuid.uuid4())
+    allowed = await asyncio.to_thread(claim_session, session_id, account_id)
+    if not allowed:
+        raise HTTPException(status_code=404, detail="No chat with that id")
+    await asyncio.to_thread(accounts.clear_pending, session_id)
+    start_read_mappings()
+    session = open_session(session_id)
+    ctx, trace = _open_turn(account_id, session_id, body.message)
+    hooks = RecordToolCalls(trace=trace)
+    run_config = RunConfig(call_model_input_filter=_prepare_model_input)
+
+    async def run():
+        try:
+            await _arm_mappings(session, hooks)
+            result = await Runner.run(
+                agent,
+                body.message,
+                session=session,
+                hooks=hooks,
+                max_turns=25,
+                run_config=run_config,
+                context=ctx,
+            )
+            if await _pause_for_approval(result, hooks, trace, session_id, account_id):
+                return
+            response = result.final_output or ""
+        except Exception as e:
+            # Auth, billing, a model that is not running: show it in the chat, not as a 500.
+            response = f"Model call failed: {type(e).__name__}: {str(e)[:300]}"
+        await _emit_done(hooks, trace, body.message, response, session_id, account_id, ctx.profile)
+
+    return _event_stream(hooks, run)
+
+
+@app.post("/chat/resume")
+async def resume(body: ResumeRequest, http_request: Request):
+    account_id = _require_account(http_request)
+    payload = await asyncio.to_thread(accounts.load_pending, body.session_id, account_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="No profile change is waiting")
+    allowed = await asyncio.to_thread(owns_session, body.session_id, account_id)
+    if not allowed:
+        raise HTTPException(status_code=404, detail="No chat with that id")
+    await asyncio.to_thread(accounts.clear_pending, body.session_id)
+    session = open_session(body.session_id)
+
+    def restore(data):
+        ctx = from_dict(data if isinstance(data, dict) else {})
+        ctx.account_id = account_id
+        ctx.profile = accounts.get_profile(account_id)
+        CURRENT.set(ctx)
+        return ctx
+
+    state = await RunState.from_json(agent, payload, context_deserializer=restore)
+    ctx = CURRENT.get() or RentalContext(account_id=account_id, profile=accounts.get_profile(account_id))
+    trace = observe.start_trace(account_id, body.session_id, ctx.user_message or "profile approval")
+    ctx.trace_id = trace.trace_id
+    hooks = RecordToolCalls(trace=trace)
+    run_config = RunConfig(call_model_input_filter=_prepare_model_input)
+    for item in state.get_interruptions():
+        if body.approved:
+            state.approve(item)
+        else:
+            state.reject(
+                item,
+                rejection_message="The user rejected this profile update. The profile was not saved.",
+            )
+
+    async def run():
+        try:
+            result = await Runner.run(
+                agent,
+                state,
+                session=session,
+                hooks=hooks,
+                max_turns=25,
+                run_config=run_config,
+            )
+            if await _pause_for_approval(result, hooks, trace, body.session_id, account_id):
+                return
+            response = result.final_output or ""
+        except Exception as e:
+            response = f"Model call failed: {type(e).__name__}: {str(e)[:300]}"
+        await _emit_done(
+            hooks, trace, ctx.user_message, response, body.session_id, account_id, ctx.profile
+        )
+
+    return _event_stream(hooks, run)
 
 
 @app.get("/threads")
-def threads(http_request: Request, response: Response):
-    return {"threads": list_threads(_bind_user(http_request, response))}
+def threads(http_request: Request):
+    return {"threads": list_threads(_require_account(http_request))}
 
 
 @app.get("/threads/{session_id}")
-def thread(session_id: str, http_request: Request, response: Response):
-    loaded = load_thread(session_id, _bind_user(http_request, response))
+def thread(session_id: str, http_request: Request):
+    loaded = load_thread(session_id, _require_account(http_request))
     if loaded is None:
         raise HTTPException(status_code=404, detail="No chat with that id")
     return loaded
 
 
 @app.post("/listings/preview")
-def preview(request: PreviewRequest):
-    return {"listings": cards_for(request.listing_ids)}
+def preview(request: PreviewRequest, http_request: Request):
+    return {"listings": cards_for(request.listing_ids, _require_account(http_request))}
 
 
 @app.get("/favorites")
-def favorites(response: Response, sort: str = "recent"):
+def favorites(http_request: Request, response: Response, sort: str = "recent"):
     response.headers["Cache-Control"] = "no-store"
-    return list_favorites(sort)
+    return list_favorites(_require_account(http_request), sort)
 
 
 @app.post("/favorites")
-def favorite(request: FavoriteRequest):
-    card = add_favorite(request.listing_id)
+def favorite(request: FavoriteRequest, http_request: Request):
+    card = add_favorite(_require_account(http_request), request.listing_id)
     if card is None:
         raise HTTPException(status_code=404, detail="No listing with that id")
     return card
 
 
 @app.delete("/favorites/{listing_id}")
-def unfavorite(listing_id: str):
-    if not remove_favorite(listing_id):
+def unfavorite(listing_id: str, http_request: Request):
+    if not remove_favorite(_require_account(http_request), listing_id):
         raise HTTPException(status_code=404, detail="That listing is not saved")
     return {"status": "ok"}
 
 
 @app.post("/clear")
-async def clear(http_request: Request, response: Response, session_id: str | None = None):
-    user_id = _bind_user(http_request, response)
+async def clear(http_request: Request, session_id: str | None = None):
+    account_id = _require_account(http_request)
     if session_id:
-        allowed = await asyncio.to_thread(owns_session, session_id, user_id)
+        allowed = await asyncio.to_thread(owns_session, session_id, account_id)
         if not allowed:
             raise HTTPException(status_code=404, detail="No chat with that id")
         await open_session(session_id).clear_session()

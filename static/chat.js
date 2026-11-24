@@ -39,6 +39,10 @@ const state = {
     threads: [],
     favorites: [],
     sending: false,
+    account: null,
+    mapsKey: "",
+    clientId: "",
+    mapsReady: null,
 };
 
 function el(tag, className, text) {
@@ -241,6 +245,7 @@ function unitLine(listing) {
 function metaLine(listing) {
     const parts = [];
     if (listing.neighborhood) parts.push(listing.neighborhood);
+    if (listing.street) parts.push(listing.street);
     const unit = unitLine(listing);
     if (unit) parts.push(unit);
     if (listing.beds === 0) parts.push("Studio");
@@ -442,6 +447,15 @@ const STEP_LABELS = {
     get_enum_values: "Checking allowed values",
     run_sql: "Running a query",
     search_places: "Searching places",
+    get_directions: "Checking the route",
+    commute_from_listing: "Checking the commute",
+    neighborhood_activities: "Looking up things to do",
+    show_listing_map: "Locating the unit",
+    average_rent_by_neighborhood: "Averaging rent by neighborhood",
+    average_rent_by_unit_type: "Averaging rent by apartment type",
+    listing_mix: "Counting the listing mix",
+    neighborhood_price_map: "Mapping neighborhood rents",
+    save_profile: "Saving the renter profile",
 };
 
 function stepLabel(name) {
@@ -565,6 +579,232 @@ function attachInlineListings(answer, listings) {
     return used;
 }
 
+function moneyTick(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "";
+    return `$${Math.round(number).toLocaleString("en-US")}`;
+}
+
+function chartLabel(point, unit) {
+    if (unit === "usd") return moneyTick(point.value);
+    return Number(point.value).toLocaleString("en-US");
+}
+
+function barChart(spec) {
+    const points = (spec.points || []).filter((point) => point && point.value != null);
+    if (!points.length) return null;
+    const width = 420;
+    const row = 28;
+    const labelW = 148;
+    const height = points.length * row + 8;
+    const max = Math.max(...points.map((point) => Number(point.value) || 0), 1);
+    const bars = points.map((point, index) => {
+        const y = 8 + index * row;
+        const length = Math.max(2, ((Number(point.value) || 0) / max) * (width - labelW - 72));
+        return `<text x="0" y="${y + 16}" font-size="12">${escapeHtml(point.label)}</text>
+            <rect x="${labelW}" y="${y + 4}" width="${length}" height="14" fill="#234737"></rect>
+            <text x="${labelW + length + 6}" y="${y + 16}" font-size="12">${escapeHtml(chartLabel(point, spec.unit))}</text>`;
+    }).join("");
+    const wrap = el("figure", "chart");
+    wrap.append(el("figcaption", "chart-title", spec.title || "Chart"));
+    wrap.insertAdjacentHTML("beforeend", `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(spec.title || "Bar chart")}">${bars}</svg>`);
+    return wrap;
+}
+
+function pieChart(spec) {
+    const points = (spec.points || []).filter((point) => Number(point.value) > 0);
+    if (!points.length) return null;
+    const total = points.reduce((sum, point) => sum + Number(point.value), 0);
+    const colors = ["#234737", "#6d8f78", "#b08968", "#8c4a3a", "#3d4c5c", "#c4a574", "#5c6b4a", "#7a6a58"];
+    let angle = -Math.PI / 2;
+    const slices = points.map((point, index) => {
+        const share = Number(point.value) / total;
+        const next = angle + share * Math.PI * 2;
+        const large = share > 0.5 ? 1 : 0;
+        const x1 = 80 + Math.cos(angle) * 62;
+        const y1 = 80 + Math.sin(angle) * 62;
+        const x2 = 80 + Math.cos(next) * 62;
+        const y2 = 80 + Math.sin(next) * 62;
+        const path = share >= 0.999
+            ? `<circle cx="80" cy="80" r="62" fill="${colors[index % colors.length]}"></circle>`
+            : `<path d="M80 80 L${x1} ${y1} A62 62 0 ${large} 1 ${x2} ${y2} Z" fill="${colors[index % colors.length]}"></path>`;
+        angle = next;
+        return path;
+    }).join("");
+    const legend = points.map((point, index) => {
+        const pct = Math.round((Number(point.value) / total) * 100);
+        return `<div><span style="color:${colors[index % colors.length]}">●</span> ${escapeHtml(point.label)} ${pct}%</div>`;
+    }).join("");
+    const wrap = el("figure", "chart");
+    wrap.append(el("figcaption", "chart-title", spec.title || "Listing mix"));
+    wrap.insertAdjacentHTML("beforeend", `<svg class="pie" viewBox="0 0 160 160" role="img" aria-label="${escapeHtml(spec.title || "Pie chart")}">${slices}</svg><div class="meta">${legend}</div>`);
+    return wrap;
+}
+
+function appendCharts(section, charts) {
+    (charts || []).forEach((spec) => {
+        const node = spec.type === "pie" ? pieChart(spec) : spec.type === "bar" ? barChart(spec) : null;
+        if (node) section.append(node);
+    });
+}
+
+function loadMaps() {
+    if (!state.mapsKey) return Promise.resolve(false);
+    if (window.google && window.google.maps) return Promise.resolve(true);
+    if (state.mapsReady) return state.mapsReady;
+    state.mapsReady = new Promise((resolve) => {
+        const script = document.createElement("script");
+        script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(state.mapsKey)}`;
+        script.async = true;
+        script.onload = () => resolve(true);
+        script.onerror = () => resolve(false);
+        document.head.append(script);
+    });
+    return state.mapsReady;
+}
+
+function decodePolyline(encoded) {
+    const points = [];
+    let index = 0;
+    let lat = 0;
+    let lng = 0;
+    while (index < encoded.length) {
+        let result = 0;
+        let shift = 0;
+        let byte = 0;
+        do {
+            byte = encoded.charCodeAt(index++) - 63;
+            result |= (byte & 0x1f) << shift;
+            shift += 5;
+        } while (byte >= 0x20);
+        lat += (result & 1) ? ~(result >> 1) : result >> 1;
+        result = 0;
+        shift = 0;
+        do {
+            byte = encoded.charCodeAt(index++) - 63;
+            result |= (byte & 0x1f) << shift;
+            shift += 5;
+        } while (byte >= 0x20);
+        lng += (result & 1) ? ~(result >> 1) : result >> 1;
+        points.push({ lat: lat / 1e5, lng: lng / 1e5 });
+    }
+    return points;
+}
+
+function rentColor(value, min, max) {
+    const span = max - min || 1;
+    const t = (Number(value) - min) / span;
+    return `hsl(${Math.round(140 - t * 140)} 42% 38%)`;
+}
+
+function appendMap(section, map) {
+    if (!map) return;
+    const pins = map.pins || [];
+    const circles = map.circles || [];
+    const routes = map.routes || [];
+    if (!pins.length && !circles.length && !routes.length) return;
+    const block = el("div", "map-block");
+    const title = circles.length ? "Average rent by neighborhood" : routes.length ? "Commute" : "Map";
+    block.append(el("p", "map-title", title));
+    const canvas = el("div", "map-canvas");
+    block.append(canvas);
+    section.append(block);
+    loadMaps().then((ready) => {
+        if (!ready || !window.google) {
+            canvas.replaceWith(el("p", "meta", "Map unavailable. Set GOOGLE_MAPS_API_KEY and allow this page's origin."));
+            return;
+        }
+        const first = pins[0] || circles[0] || { lat: 40.75, lng: -73.98 };
+        const view = new google.maps.Map(canvas, {
+            center: { lat: Number(first.lat), lng: Number(first.lng) },
+            zoom: circles.length ? 12 : 13,
+            mapTypeControl: false,
+            streetViewControl: false,
+        });
+        const bounds = new google.maps.LatLngBounds();
+        pins.forEach((pin) => {
+            const position = { lat: Number(pin.lat), lng: Number(pin.lng) };
+            bounds.extend(position);
+            new google.maps.Marker({ map: view, position, title: pin.label || "" });
+        });
+        if (circles.length) {
+            const values = circles.map((point) => Number(point.value) || 0);
+            const min = Math.min(...values);
+            const max = Math.max(...values);
+            circles.forEach((point) => {
+                const position = { lat: Number(point.lat), lng: Number(point.lng) };
+                bounds.extend(position);
+                new google.maps.Circle({
+                    map: view,
+                    center: position,
+                    radius: 450,
+                    strokeWeight: 0,
+                    fillColor: rentColor(point.value, min, max),
+                    fillOpacity: 0.75,
+                });
+                new google.maps.Marker({
+                    map: view,
+                    position,
+                    label: { text: point.label || "", fontSize: "11px" },
+                    icon: { path: google.maps.SymbolPath.CIRCLE, scale: 0 },
+                });
+            });
+        }
+        routes.forEach((route) => {
+            if (!route.polyline) return;
+            const path = decodePolyline(route.polyline);
+            path.forEach((point) => bounds.extend(point));
+            new google.maps.Polyline({ map: view, path, strokeColor: "#234737", strokeWeight: 4 });
+        });
+        if (!bounds.isEmpty()) view.fitBounds(bounds, 32);
+    });
+}
+
+function appendFollowups(section, prompts) {
+    if (!prompts || !prompts.length) return;
+    const row = el("div", "followups");
+    prompts.forEach((prompt) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "btn btn-secondary";
+        button.textContent = prompt;
+        button.addEventListener("click", () => send(prompt));
+        row.append(button);
+    });
+    section.append(row);
+}
+
+function finishTurn(section, turn) {
+    appendCharts(section, turn.charts);
+    appendMap(section, turn.map);
+    appendFollowups(section, turn.follow_ups);
+    return section;
+}
+
+function renderApproval(section, event) {
+    const box = el("div", "approval");
+    const fields = event.arguments || {};
+    const lines = Object.entries(fields)
+        .filter(([, value]) => value != null && value !== "")
+        .map(([key, value]) => `${key.replaceAll("_", " ")}: ${value}`);
+    box.append(el("p", null, "Save this on your account?"));
+    if (lines.length) box.append(el("p", "meta", lines.join(" · ")));
+    const actions = el("div", "approval-actions");
+    const approve = document.createElement("button");
+    approve.type = "button";
+    approve.className = "btn btn-primary";
+    approve.textContent = "Approve";
+    approve.addEventListener("click", () => resume(true, section));
+    const reject = document.createElement("button");
+    reject.type = "button";
+    reject.className = "btn btn-secondary";
+    reject.textContent = "Reject";
+    reject.addEventListener("click", () => resume(false, section));
+    actions.append(approve, reject);
+    box.append(actions);
+    section.append(box);
+}
+
 function renderTurn(turn) {
     const section = el("article", "turn");
     if (turn.user) section.append(el("p", "user", turn.user));
@@ -593,7 +833,7 @@ function renderTurn(turn) {
         } else if (rest.length === 1) {
             section.append(featureCard(rest[0]));
         }
-        return section;
+        return finishTurn(section, turn);
     }
     if ((turn.display === "grid" || turn.display === "paired") && listings.length) {
         const split = el("div", "result-split");
@@ -606,7 +846,7 @@ function renderTurn(turn) {
         if (answer) section.append(answer);
         if (turn.display === "single" && listings[0]) section.append(featureCard(listings[0]));
     }
-    return section;
+    return finishTurn(section, turn);
 }
 
 function readEvents(buffer) {
@@ -1027,6 +1267,10 @@ async function send(text) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ message, session_id: state.sessionId }),
         });
+        if (response.status === 401) {
+            showGate();
+            throw new Error("Sign in required");
+        }
         if (!response.ok || !response.body) {
             const data = await response.json().catch(() => ({}));
             throw new Error(data.detail || response.statusText);
@@ -1043,10 +1287,19 @@ async function send(text) {
             buffer = parsed.rest;
             parsed.events.forEach((event) => {
                 if (event.type === "done") finished = event;
-                else applyStreamEvent(pending, event);
+                else if (event.type === "approval") {
+                    pending._approval = event;
+                    renderApproval(pending, event);
+                } else applyStreamEvent(pending, event);
             });
         }
-        if (!finished) throw new Error("The reply ended before an answer arrived.");
+        if (!finished) {
+            if (pending._approval) {
+                state.sessionId = pending._approval.session_id || state.sessionId;
+                return;
+            }
+            throw new Error("The reply ended before an answer arrived.");
+        }
         if (!log.contains(pending)) {
             keepFocus = false;
             refreshThreads();
@@ -1060,6 +1313,9 @@ async function send(text) {
             tool_calls: finished.tool_calls || [],
             display: finished.display || "none",
             listings: finished.listings || [],
+            charts: finished.charts || [],
+            map: finished.map || null,
+            follow_ups: finished.follow_ups || [],
         });
         pending.replaceWith(done);
         const answer = done.querySelector(".answer, .feature, .cards") || done;
@@ -1110,7 +1366,141 @@ input.addEventListener("input", () => {
     input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
 });
 
-async function init() {
+async function resume(approved, section) {
+    if (state.sending) return;
+    setBusy(true);
+    const box = section.querySelector(".approval");
+    if (box) box.remove();
+    let keepFocus = true;
+    try {
+        const response = await fetch("/chat/resume", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: state.sessionId, approved }),
+        });
+        if (response.status === 401) {
+            showGate();
+            throw new Error("Sign in required");
+        }
+        if (!response.ok || !response.body) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.detail || response.statusText);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let finished = null;
+        while (!finished) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            buffer += decoder.decode(chunk.value, { stream: true });
+            const parsed = readEvents(buffer);
+            buffer = parsed.rest;
+            parsed.events.forEach((event) => {
+                if (event.type === "done") finished = event;
+                else if (event.type === "approval") {
+                    section._approval = event;
+                    renderApproval(section, event);
+                } else if (section._liveList) applyStreamEvent(section, event);
+            });
+        }
+        if (!finished) {
+            if (section._approval) return;
+            throw new Error("The reply ended before an answer arrived.");
+        }
+        state.sessionId = finished.session_id || state.sessionId;
+        const user = section.querySelector(".user");
+        const done = renderTurn({
+            user: user ? user.textContent : "",
+            response: finished.response || "",
+            tool_calls: finished.tool_calls || [],
+            display: finished.display || "none",
+            listings: finished.listings || [],
+            charts: finished.charts || [],
+            map: finished.map || null,
+            follow_ups: finished.follow_ups || [],
+        });
+        section.replaceWith(done);
+        refreshThreads();
+    } catch (error) {
+        section.append(el("p", "meta", error.message));
+    } finally {
+        setBusy(false);
+        if (keepFocus) input.focus();
+    }
+}
+
+function renderAccount() {
+    const node = document.getElementById("account");
+    if (!node) return;
+    node.replaceChildren();
+    if (!state.account) return;
+    node.append(document.createTextNode(state.account.email || state.account.name || "Signed in"));
+    const out = document.createElement("button");
+    out.type = "button";
+    out.className = "btn btn-quiet";
+    out.textContent = "Sign out";
+    out.addEventListener("click", async () => {
+        await fetch("/auth/logout", { method: "POST" });
+        state.account = null;
+        showGate();
+    });
+    node.append(document.createTextNode(" "));
+    node.append(out);
+}
+
+function showGate() {
+    const gate = document.getElementById("gate");
+    const note = document.getElementById("gate-note");
+    gate.hidden = false;
+    if (!state.clientId) {
+        note.textContent = "Set GOOGLE_CLIENT_ID in .env, then reload.";
+        return;
+    }
+    note.textContent = "";
+    const start = () => {
+        google.accounts.id.initialize({
+            client_id: state.clientId,
+            callback: async (response) => {
+                const saved = await fetch("/auth/google", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ credential: response.credential }),
+                });
+                if (!saved.ok) {
+                    const data = await saved.json().catch(() => ({}));
+                    note.textContent = data.detail || "Sign-in failed";
+                    return;
+                }
+                state.account = await saved.json();
+                gate.hidden = true;
+                renderAccount();
+                bootChat();
+            },
+        });
+        const slot = document.getElementById("google-button");
+        slot.replaceChildren();
+        google.accounts.id.renderButton(slot, {
+            theme: "outline",
+            size: "large",
+            width: 280,
+        });
+    };
+    if (window.google && window.google.accounts) {
+        start();
+        return;
+    }
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.onload = start;
+    script.onerror = () => {
+        note.textContent = "Google sign-in failed to load.";
+    };
+    document.head.append(script);
+}
+
+async function bootChat() {
     warmMappings();
     const stored = sessionStorage.getItem(STORE);
     const pendingThread = stored
@@ -1126,6 +1516,7 @@ async function init() {
         state.favorites = [];
     }
     renderRail();
+    renderAccount();
     if (pendingThread && state.threads.some((thread) => thread.session_id === stored)) {
         state.sessionId = stored;
         markCurrentThread();
@@ -1138,6 +1529,21 @@ async function init() {
         }
     }
     newChat();
+}
+
+async function init() {
+    const config = await fetch("/auth/config").then((response) => response.json()).catch(() => ({}));
+    state.mapsKey = config.maps_api_key || "";
+    state.clientId = config.client_id || "";
+    const me = await fetch("/auth/me");
+    if (!me.ok) {
+        renderEmpty();
+        showGate();
+        return;
+    }
+    state.account = await me.json();
+    renderAccount();
+    bootChat();
 }
 
 init();

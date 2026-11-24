@@ -695,3 +695,69 @@ textarea {
         animation: none !important;
     }
 }
+
+.account {
+    margin: 10px 0 0;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.gate {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    display: grid;
+    place-items: center;
+    background: var(--paper);
+    padding: 24px;
+}
+
+.gate[hidden] { display: none; }
+
+.gate-card {
+    width: min(420px, 100%);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    padding: 28px 24px;
+}
+
+.gate-card h2 {
+    margin: 6px 0 8px;
+    font-family: var(--serif);
+    font-weight: 500;
+    font-size: 36px;
+}
+
+.gate-note { color: var(--muted); min-height: 1.2em; }
+
+.chart, .map-block, .followups, .approval {
+    margin-top: 14px;
+}
+
+.chart svg { width: 100%; height: auto; display: block; }
+
+.chart svg.pie { width: 180px; height: 180px; }
+
+.chart-title, .map-title, .approval p {
+    margin: 0 0 8px;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.map-canvas {
+    height: 280px;
+    background: var(--photo);
+    border: 1px solid var(--line);
+}
+
+.followups { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.followups button, .approval button { text-align: left; }
+
+.approval {
+    padding: 12px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+}
+
+.approval-actions { display: flex; gap: 8px; margin-top: 10px; }
