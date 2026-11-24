@@ -55,7 +55,12 @@ def _load_fixed(conn: sqlite3.Connection, table: str) -> int:
         bq.load_rows(table, [], schema)
         return 0
     names = [field.name for field in schema]
-    quoted = ", ".join(f'"{name}"' for name in names)
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    # Older conversation files have no user_id. Load those rows with a null owner.
+    quoted = ", ".join(
+        f'"{name}"' if name in existing else f'NULL AS "{name}"'
+        for name in names
+    )
     records = [dict(row) for row in conn.execute(f"SELECT {quoted} FROM {table}")]
     rows = bq.rows_for_schema(records, schema)
     return bq.load_rows(table, rows, schema)

@@ -135,6 +135,7 @@ SCHEMAS: dict[str, list[bigquery.SchemaField]] = {
         ("session_id", "STRING"),
         ("created_at", "STRING"),
         ("updated_at", "STRING"),
+        ("user_id", "STRING"),
     ),
     "agent_messages": _columns(
         ("id", "INT64"),
@@ -408,6 +409,11 @@ def ensure_tables() -> None:
     for name, schema in SCHEMAS.items():
         table = bigquery.Table(_table_ref(name), schema=schema)
         bq.create_table(table, exists_ok=True)
+    # create_table leaves an existing agent_sessions table on its old columns.
+    execute(
+        f"ALTER TABLE {quote_ident('agent_sessions')} "
+        "ADD COLUMN IF NOT EXISTS user_id STRING"
+    )
     _tables_ready = True
 
 
@@ -695,6 +701,52 @@ def delete_favorite(listing_id: str) -> bool:
         (listing_id,),
     )
     return not left
+
+
+def owns_session(session_id: str, user_id: str) -> bool:
+    """True when this session row belongs to ``user_id``. A missing owner does not."""
+    ensure_tables()
+    rows = query_dicts(
+        f"""
+        SELECT session_id
+        FROM {quote_ident('agent_sessions')}
+        WHERE session_id = ? AND user_id = ?
+        """,
+        (session_id, user_id),
+    )
+    return bool(rows)
+
+
+def claim_session(session_id: str, user_id: str, now: str) -> bool:
+    """Create the session for ``user_id``, or accept it when they already own it.
+
+    An existing row is not rewritten. A chat left over from before owners
+    existed, or a chat owned by someone else, stays theirs.
+    """
+    ensure_tables()
+    sql = f"""
+        MERGE {quote_ident('agent_sessions')} T
+        USING (
+            SELECT @session_id AS session_id,
+                   @now AS created_at,
+                   @now AS updated_at,
+                   @user_id AS user_id
+        ) S
+        ON T.session_id = S.session_id
+        WHEN NOT MATCHED THEN INSERT (session_id, created_at, updated_at, user_id)
+            VALUES (S.session_id, S.created_at, S.updated_at, S.user_id)
+    """
+    parameters = [
+        bigquery.ScalarQueryParameter("session_id", "STRING", session_id),
+        bigquery.ScalarQueryParameter("now", "STRING", now),
+        bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
+    ]
+
+    def run() -> None:
+        client().query(sql, job_config=_job_config(parameters)).result()
+
+    _run(run)
+    return owns_session(session_id, user_id)
 
 
 def touch_session(session_id: str, now: str) -> None:

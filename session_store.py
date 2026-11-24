@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
@@ -101,3 +102,140 @@ def open_session(session_id: str):
     from present import SESSIONS_DB
 
     return SQLiteSession(session_id, str(SESSIONS_DB))
+
+
+_MAX_SESSION_ID = 128
+_MAX_USER_ID = 64
+
+
+def _ids_ok(session_id: str, user_id: str) -> bool:
+    return (
+        isinstance(session_id, str)
+        and isinstance(user_id, str)
+        and 1 <= len(session_id) <= _MAX_SESSION_ID
+        and 1 <= len(user_id) <= _MAX_USER_ID
+    )
+
+
+def _sqlite():
+    from present import SESSIONS_DB
+
+    conn = sqlite3.connect(SESSIONS_DB, timeout=5)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _ensure_owner_column(conn: sqlite3.Connection) -> None:
+    """Add ``user_id`` without disturbing the Agents SDK session tables."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_sessions (
+            session_id TEXT PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            user_id TEXT
+        )
+        """
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(agent_sessions)")}
+    if "user_id" not in columns:
+        conn.execute("ALTER TABLE agent_sessions ADD COLUMN user_id TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            message_data TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES agent_sessions (session_id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_user_id
+        ON agent_sessions (user_id)
+        """
+    )
+
+
+def ensure_session_schema() -> None:
+    """Make sure session rows can store an owner. No file is created just to list."""
+    if bq.prod():
+        bq.ensure_tables()
+        return
+    from present import SESSIONS_DB
+
+    if not SESSIONS_DB.exists():
+        return
+    conn = _sqlite()
+    try:
+        _ensure_owner_column(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def owns_session(session_id: str, user_id: str) -> bool:
+    """True only when this user already owns the session."""
+    if not _ids_ok(session_id, user_id):
+        return False
+    if bq.prod():
+        return bq.owns_session(session_id, user_id)
+    from present import SESSIONS_DB
+
+    if not SESSIONS_DB.exists():
+        return False
+    conn = _sqlite()
+    try:
+        _ensure_owner_column(conn)
+        conn.commit()
+        row = conn.execute(
+            """
+            SELECT user_id FROM agent_sessions
+            WHERE session_id = ? AND user_id = ?
+            """,
+            (session_id, user_id),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def claim_session(session_id: str, user_id: str) -> bool:
+    """Reserve a new session for this user, or accept one they already own.
+
+    Does not take over a session that has no owner, or one owned by someone else.
+    """
+    if not _ids_ok(session_id, user_id):
+        return False
+    if bq.prod():
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return bq.claim_session(session_id, user_id, now)
+    conn = _sqlite()
+    try:
+        _ensure_owner_column(conn)
+        row = conn.execute(
+            "SELECT user_id FROM agent_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is not None:
+            conn.commit()
+            return row["user_id"] == user_id
+        try:
+            conn.execute(
+                "INSERT INTO agent_sessions (session_id, user_id) VALUES (?, ?)",
+                (session_id, user_id),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            raced = conn.execute(
+                "SELECT user_id FROM agent_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return raced is not None and raced["user_id"] == user_id
+    finally:
+        conn.close()

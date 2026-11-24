@@ -452,7 +452,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--db", type=str, default=dbm.DEFAULT_DB_PATH, help="SQLite database path")
     p.add_argument("--price-min", type=int, default=3000, help="Minimum rent ($/mo)")
-    p.add_argument("--price-max", type=int, default=10000, help="Maximum rent ($/mo)")
+    p.add_argument("--price-max", type=int, default=12000, help="Maximum rent ($/mo)")
     p.add_argument(
         "--areas",
         type=str,

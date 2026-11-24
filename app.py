@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from agents import (
 )
 from agents.extensions.models.litellm_model import LitellmModel
 from agents.run_config import ModelInputData, RunConfig
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -32,7 +33,7 @@ from present import (
     resolve_display,
 )
 from scripts import bq
-from session_store import open_session
+from session_store import claim_session, open_session, owns_session
 from tools import (
     ANALYSIS_TOOLS,
     PLACES_TOOLS,
@@ -351,6 +352,42 @@ init_ui()
 
 app = FastAPI()
 
+# One browser, one history. The id is random and stays in an HttpOnly cookie,
+# so a request cannot ask for someone else's chats by passing a user id.
+USER_COOKIE = "chat_user"
+_USER_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+def _user_from(request: Request) -> tuple[str, bool]:
+    current = request.cookies.get(USER_COOKIE, "")
+    if _USER_ID.fullmatch(current):
+        return current, False
+    return str(uuid.uuid4()), True
+
+
+def _set_user_cookie(response: Response, request: Request, user_id: str) -> None:
+    forwarded = request.headers.get("x-forwarded-proto", "")
+    secure = request.url.scheme == "https" or forwarded.split(",")[0].strip().lower() == "https"
+    response.set_cookie(
+        USER_COOKIE,
+        user_id,
+        max_age=60 * 60 * 24 * 400,
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+        path="/",
+    )
+
+
+def _bind_user(request: Request, response: Response) -> str:
+    """Read the browser's user id, and set the cookie when this browser is new."""
+    user_id, minted = _user_from(request)
+    if minted:
+        _set_user_cookie(response, request, user_id)
+    return user_id
+
 
 class ChatRequest(BaseModel):
     message: str
@@ -366,13 +403,18 @@ class FavoriteRequest(BaseModel):
 
 
 @app.get("/")
-def index():
+def index(request: Request):
     # The empty chat is on screen before anyone sends. Load the columns then.
+    # The cookie is set on this response, before the page asks for /threads.
     start_read_mappings()
-    return FileResponse(
+    user_id, minted = _user_from(request)
+    response = FileResponse(
         Path(__file__).parent / "index.html",
         headers={"Cache-Control": "no-cache"},
     )
+    if minted:
+        _set_user_cookie(response, request, user_id)
+    return response
 
 
 @app.post("/mappings/warm")
@@ -395,13 +437,18 @@ async def _arm_mappings(session, hooks) -> Agent:
 
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
-    # Get or create the session. A new session on the same id sees the same history.
+async def chat(body: ChatRequest, http_request: Request):
+    # A new id is stored for this browser. An id this browser does not own is refused
+    # before the model runs, so the reply cannot be written into someone else's chat.
     # Events stream as the tools run, so the page can show each step before the answer exists.
     # The column read may already be running from the empty chat. Join it here, and
     # show that step only once the other tool calls are on screen.
+    user_id, minted = _user_from(http_request)
+    session_id = body.session_id or str(uuid.uuid4())
+    allowed = await asyncio.to_thread(claim_session, session_id, user_id)
+    if not allowed:
+        raise HTTPException(status_code=404, detail="No chat with that id")
     start_read_mappings()
-    session_id = request.session_id or str(uuid.uuid4())
     session = open_session(session_id)
     hooks = RecordToolCalls()
     run_config = RunConfig(call_model_input_filter=_drop_prefetch_mappings)
@@ -411,7 +458,7 @@ async def chat(request: ChatRequest):
             run_agent = await _arm_mappings(session, hooks)
             result = await Runner.run(
                 run_agent,
-                request.message,
+                body.message,
                 session=session,
                 hooks=hooks,
                 max_turns=25,
@@ -427,7 +474,7 @@ async def chat(request: ChatRequest):
         # Card lookup hits SQLite or BigQuery. Keep it off the event loop so the
         # page can keep painting tool steps and the sidebar stays clickable.
         presented = await asyncio.to_thread(
-            resolve_display, request.message, tool_calls, response
+            resolve_display, body.message, tool_calls, response
         )
         await hooks.events.put({
             "type": "done",
@@ -452,21 +499,24 @@ async def chat(request: ChatRequest):
             if not task.done():
                 task.cancel()
 
-    return StreamingResponse(
+    stream = StreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+    if minted:
+        _set_user_cookie(stream, http_request, user_id)
+    return stream
 
 
 @app.get("/threads")
-def threads():
-    return {"threads": list_threads()}
+def threads(http_request: Request, response: Response):
+    return {"threads": list_threads(_bind_user(http_request, response))}
 
 
 @app.get("/threads/{session_id}")
-def thread(session_id: str):
-    loaded = load_thread(session_id)
+def thread(session_id: str, http_request: Request, response: Response):
+    loaded = load_thread(session_id, _bind_user(http_request, response))
     if loaded is None:
         raise HTTPException(status_code=404, detail="No chat with that id")
     return loaded
@@ -499,8 +549,12 @@ def unfavorite(listing_id: str):
 
 
 @app.post("/clear")
-async def clear(session_id: str | None = None):
+async def clear(http_request: Request, response: Response, session_id: str | None = None):
+    user_id = _bind_user(http_request, response)
     if session_id:
+        allowed = await asyncio.to_thread(owns_session, session_id, user_id)
+        if not allowed:
+            raise HTTPException(status_code=404, detail="No chat with that id")
         await open_session(session_id).clear_session()
     return {"status": "ok"}
 

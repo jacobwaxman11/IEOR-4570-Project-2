@@ -537,13 +537,19 @@ def _text_content(content) -> str:
     return ""
 
 
-def _load_items(session_id: str) -> list[dict]:
+def _load_items(session_id: str, user_id: str) -> list[dict]:
     if not _sessions_ready():
         return []
     rows = _rows(
         _sessions,
-        "SELECT message_data FROM agent_messages WHERE session_id = ? ORDER BY id",
-        (session_id,),
+        """
+        SELECT m.message_data
+        FROM agent_messages m
+        JOIN agent_sessions s ON s.session_id = m.session_id
+        WHERE m.session_id = ? AND s.user_id = ?
+        ORDER BY m.id
+        """,
+        (session_id, user_id),
     )
     items = []
     for row in rows:
@@ -674,12 +680,16 @@ def _title_from_messages(session_id: str, first_blob: str | None) -> str:
     return "Chat"
 
 
-def list_threads() -> list[dict]:
-    if not _sessions_ready():
+def list_threads(user_id: str) -> list[dict]:
+    if not user_id or not _sessions_ready():
         return []
+    from session_store import ensure_session_schema
+
+    ensure_session_schema()
     # The first message is joined through a grouped id, not a subquery in ON.
     # BigQuery rejects that subquery ("Unsupported subquery with table in join
     # predicate"), so /threads 500s in prod and the sidebar stays empty.
+    # user_id keeps one browser's chats out of every other browser's sidebar.
     rows = _rows(
         _sessions,
         """
@@ -691,8 +701,10 @@ def list_threads() -> list[dict]:
             FROM agent_messages
             GROUP BY session_id
         ) first_msg ON first_msg.session_id = m.session_id AND first_msg.id = m.id
+        WHERE s.user_id = ?
         ORDER BY s.updated_at DESC
         """,
+        (user_id,),
     )
     return [
         {
@@ -704,17 +716,23 @@ def list_threads() -> list[dict]:
     ]
 
 
-def load_thread(session_id: str) -> dict | None:
-    if not _sessions_ready():
+def load_thread(session_id: str, user_id: str) -> dict | None:
+    if not user_id or not _sessions_ready():
         return None
+    from session_store import ensure_session_schema
+
+    ensure_session_schema()
     found = _rows(
         _sessions,
-        "SELECT session_id FROM agent_sessions WHERE session_id = ?",
-        (session_id,),
+        """
+        SELECT session_id FROM agent_sessions
+        WHERE session_id = ? AND user_id = ?
+        """,
+        (session_id, user_id),
     )
     if not found:
         return None
-    turns = _turns(_load_items(session_id))
+    turns = _turns(_load_items(session_id, user_id))
     title = _title_from(next((turn["user"] for turn in turns if turn["user"]), ""))
     return {"session_id": session_id, "title": title, "turns": turns}
 
