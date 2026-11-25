@@ -10,6 +10,13 @@ available_from, floor plan) are filled in afterwards by ``backfill_details.py``.
 Re-runs are additive and idempotent: existing listing_ids are skipped, and only
 newly-discovered listings get processed.
 
+StreetEasy search pages are fetched with ``curl_cffi`` (Chrome TLS
+impersonation), same as ``backfill_details.py``. Do not set a custom
+User-Agent on that session: it drops the impersonation headers and PerimeterX
+answers 403. The first 403 stops pagination and exits 2 so a blocked IP is
+not requested again. Listings already collected in that run are still saved.
+A pause (default 4–8s) runs before every search page.
+
 Example (from this directory; uv uses the project environment):
     uv run scrape_listings.py \\
         --price-min 4000 --price-max 6000 \\
@@ -28,12 +35,14 @@ import json
 import os
 import random
 import sqlite3
+import sys
 import time
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
+from curl_cffi import requests as cffi_requests
 
 import db as dbm
 
@@ -60,6 +69,9 @@ def normalize_image_url(url: str) -> str:
     return url
 
 
+# Used for the photo CDN and by update_listings.py. StreetEasy search does not
+# send these: a custom User-Agent makes curl_cffi drop sec-ch-ua / sec-fetch-*
+# and PerimeterX 403s the mismatched fingerprint.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -177,29 +189,38 @@ def parse_listing(apt: dict) -> dict:
 # ── Fetchers ─────────────────────────────────────────────────────────────────
 
 
-def fetch_search_page(url: str, client: httpx.Client) -> list[dict]:
+def fetch_search_page(
+    url: str, session: "cffi_requests.Session", timeout: int = 20
+) -> tuple[list[dict], int]:
+    """Fetch one search page. Returns ``(listings, status_code)``.
+
+    Leave headers to the impersonation profile. A non-200 response yields
+    ``([], status)`` so the caller can stop on 403 instead of treating a block
+    page as an empty result set. Transport errors use status ``-1``.
+    """
     print(f"  → GET {url}")
     try:
-        response = client.get(url, timeout=15)
+        response = session.get(url, timeout=timeout)
     except Exception as e:
         print(f"  ✗ Request failed: {e}")
-        return []
+        return [], -1
 
-    print(f"  ← {response.status_code} ({len(response.text):,} chars)")
-    if response.status_code != 200:
-        return []
+    http_status = response.status_code
+    print(f"  ← {http_status} ({len(response.text):,} chars)")
+    if http_status != 200:
+        return [], http_status
 
     soup = BeautifulSoup(response.text, "html.parser")
     tag = soup.find("script", {"type": "application/ld+json"})
     if not tag:
         print("  ✗ No ld+json tag found")
-        return []
+        return [], http_status
 
     try:
         graph = json.loads(tag.string).get("@graph", [])
     except json.JSONDecodeError as e:
         print(f"  ✗ Failed to parse ld+json: {e}")
-        return []
+        return [], http_status
 
     listings = [parse_listing(it) for it in graph if it.get("@type") == "Apartment"]
     nodes = listing_nodes_by_path(response.text)
@@ -225,7 +246,7 @@ def fetch_search_page(url: str, client: httpx.Client) -> list[dict]:
         f"  ✓ Parsed {len(listings)} listings from page "
         f"(status ACTIVE; {matched} confirmed in page data)"
     )
-    return listings
+    return listings, http_status
 
 
 def _download_one(url: str, dest_path: str, client) -> bool:
@@ -361,7 +382,10 @@ def scrape(
     max_delay: float,
     image_min_delay: float,
     image_max_delay: float,
-) -> None:
+    impersonate: str,
+    timeout: int,
+) -> int:
+    """Returns 0 on success, 2 when StreetEasy answers 403."""
     os.makedirs(image_dir, exist_ok=True)
 
     with dbm.open_db(db_path) as conn:
@@ -372,26 +396,60 @@ def scrape(
             print(f"Starting fresh (no existing entries in {db_path})")
 
         new_to_process: list[dict] = []
+        blocked = False
 
-        with httpx.Client(headers=HEADERS, follow_redirects=True) as client:
+        with httpx.Client(headers=HEADERS, follow_redirects=True) as image_client:
             # Photos already stored with a broken host are fetched from the
             # photo CDN here, before any StreetEasy search request.
             if not skip_images:
                 repair_stored_images(
-                    conn, image_dir, client, image_min_delay, image_max_delay
+                    conn, image_dir, image_client, image_min_delay, image_max_delay
                 )
 
             # ── Stage 1: search pages ────────────────────────────────────────
             # Keep paginating until we've queued max_listings NEW listings (or
             # we run out of pages). Listings already in the DB are skipped.
             # max_listings == 0 repairs photos and does not request StreetEasy.
+            needs_search = max_listings is None or max_listings > 0
+            if needs_search:
+                session = cffi_requests.Session(impersonate=impersonate)
+                print(f"Using curl_cffi with impersonate={impersonate!r} for StreetEasy search\n")
+            else:
+                session = None
+
             for page in range(1, max_pages + 1):
+                if session is None:
+                    break
                 if max_listings is not None and len(new_to_process) >= max_listings:
                     break
 
                 print(f"\n── Search page {page} ──────────────────────────────────")
+                delay = random.uniform(min_delay, max_delay)
+                print(f"  sleeping {delay:.1f}s...")
+                time.sleep(delay)
+
                 url = build_url(price_min, price_max, area_ids, page)
-                page_listings = fetch_search_page(url, client)
+                page_listings, status = fetch_search_page(url, session, timeout=timeout)
+
+                if status == 403:
+                    blocked = True
+                    print(
+                        "\n!!! 403 (PerimeterX) — stopping search pagination "
+                        "to avoid further bans. !!!"
+                    )
+                    if new_to_process:
+                        print(
+                            f"Saving {len(new_to_process)} listing(s) already "
+                            "collected, then exiting."
+                        )
+                    else:
+                        print("No new listings collected before the block.")
+                    print("Re-run later (try a longer delay or a different IP/VPN).")
+                    break
+
+                if status != 200:
+                    print("  (search request failed — stopping pagination)")
+                    break
 
                 if not page_listings:
                     print("  (no listings returned — stopping pagination)")
@@ -411,11 +469,6 @@ def scrape(
                 if dup_count:
                     print(f"  ↺ {dup_count} already in DB, skipping")
 
-                if page < max_pages:
-                    delay = random.uniform(min_delay, max_delay)
-                    print(f"  sleeping {delay:.1f}s before next page...")
-                    time.sleep(delay)
-
             print(f"\n── {len(new_to_process)} new listings to process ──")
 
             # ── Stage 2: image downloads per NEW listing ─────────────────────
@@ -429,7 +482,7 @@ def scrape(
                 if not skip_images and listing.get("image_urls"):
                     print(f"  downloading {len(listing['image_urls'])} images...")
                     local_paths = download_images(
-                        listing, image_dir, client, image_min_delay, image_max_delay
+                        listing, image_dir, image_client, image_min_delay, image_max_delay
                     )
                     listing["local_image_paths"] = local_paths
                     n_ok = sum(1 for p in local_paths if p)
@@ -443,6 +496,7 @@ def scrape(
             f"\n── Done. {st['listings']} listings in {db_path} "
             f"({len(new_to_process)} new this run) ──"
         )
+        return 2 if blocked else 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -475,8 +529,30 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--image-dir", type=str, default="images", help="Directory for downloaded images")
     p.add_argument("--skip-images", action="store_true", help="Skip image downloads")
-    p.add_argument("--min-delay", type=float, default=1.0, help="Min delay between StreetEasy search pages (s)")
-    p.add_argument("--max-delay", type=float, default=3.0, help="Max delay between StreetEasy search pages (s)")
+    p.add_argument(
+        "--min-delay",
+        type=float,
+        default=3.0,
+        help="Min sleep before each StreetEasy search page (seconds)",
+    )
+    p.add_argument(
+        "--max-delay",
+        type=float,
+        default=6.0,
+        help="Max sleep before each StreetEasy search page (seconds)",
+    )
+    p.add_argument(
+        "--impersonate",
+        type=str,
+        default="chrome",
+        help="curl_cffi browser fingerprint. 'chrome' tracks the library's current Chrome profile",
+    )
+    p.add_argument(
+        "--timeout",
+        type=int,
+        default=20,
+        help="Per-request timeout for StreetEasy search pages (seconds)",
+    )
     p.add_argument(
         "--image-min-delay",
         type=float,
@@ -496,7 +572,7 @@ def main() -> None:
     args = parse_args()
     area_ids = [int(a.strip()) for a in args.areas.split(",") if a.strip()]
 
-    scrape(
+    code = scrape(
         db_path=args.db,
         price_min=args.price_min,
         price_max=args.price_max,
@@ -509,7 +585,10 @@ def main() -> None:
         max_delay=args.max_delay,
         image_min_delay=args.image_min_delay,
         image_max_delay=args.image_max_delay,
+        impersonate=args.impersonate,
+        timeout=args.timeout,
     )
+    sys.exit(code)
 
 
 if __name__ == "__main__":
