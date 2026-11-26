@@ -1,9 +1,10 @@
 const PROMPTS = [
-    "1-bedroom apartments in Chelsea under $6,000",
-    "What's the cheapest studio in NoMad?",
-    "Best deals in Hell's Kitchen",
-    "Compare rents in Chelsea and the West Village",
-    "What amenities does 95 Wall Street have?",
+    "Find 1-bedrooms in Chelsea under $6,500 with a doorman, an elevator, and a dishwasher, at least 600 sq ft.",
+    "What's the best 1-bedroom deal on the Upper West Side at or under $5,000? Include the address, listed rent, predicted rent, and deal score.",
+    "Compare Chelsea and the West Village for 1-bedrooms under $6,500: median rent, typical square feet, and the most common amenities.",
+    "In Hell's Kitchen, chart average rent for studios, 1-bedrooms, and 2-bedrooms, and show how many listings there are of each.",
+    "Show a map of Manhattan neighborhoods colored by average rent, and a bar chart of those averages from lowest to highest.",
+    "What amenities does 95 Wall Street have, and what's its cheapest 1-bedroom? Include the unit, square feet, and monthly rent.",
 ];
 
 const SORTS = [

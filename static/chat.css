@@ -596,6 +596,12 @@ button, textarea, select { font: inherit; color: inherit; }
 .btn-secondary { background: var(--panel); }
 .prompt, .rail-head .btn { width: 100%; text-align: left; }
 .rail-head .btn { text-align: center; }
+.prompts { max-width: 42rem; }
+.prompt {
+    white-space: normal;
+    line-height: 1.4;
+    height: auto;
+}
 
 a.btn { display: inline-flex; align-items: center; justify-content: center; }
 
